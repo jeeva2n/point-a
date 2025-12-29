@@ -1,6 +1,5 @@
-const pool = require('../config/database-mysql');
+const pool = require('../config/database');
 const bcrypt = require('bcryptjs');
-const crypto = require('crypto');
 
 class User {
   // Create new user
@@ -21,7 +20,7 @@ class User {
       `INSERT INTO users 
        (email, password, full_name, company, phone, verification_token) 
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [email, hashedPassword, full_name, company, phone, verification_token]
+      [email, hashedPassword, full_name, company || null, phone || null, verification_token || null]
     );
 
     return this.findById(result.insertId);
@@ -40,10 +39,7 @@ class User {
 
   // Find user by ID with password (for authentication)
   static async findByIdWithPassword(id) {
-    const [rows] = await pool.query(
-      'SELECT * FROM users WHERE id = ?',
-      [id]
-    );
+    const [rows] = await pool.query('SELECT * FROM users WHERE id = ?', [id]);
     return rows[0];
   }
 
@@ -149,7 +145,7 @@ class User {
   static async verifyEmail(id) {
     await pool.query(
       `UPDATE users SET 
-       email_verified = TRUE,
+       email_verified = 1,
        verification_token = NULL,
        updated_at = CURRENT_TIMESTAMP 
        WHERE id = ?`,
@@ -183,7 +179,7 @@ class User {
     // If setting as default, unset other defaults
     if (is_default) {
       await pool.query(
-        'UPDATE user_addresses SET is_default = FALSE WHERE user_id = ?',
+        'UPDATE user_addresses SET is_default = 0 WHERE user_id = ?',
         [user_id]
       );
     }
@@ -192,7 +188,7 @@ class User {
       `INSERT INTO user_addresses 
        (user_id, type, street, city, state, country, postal_code, is_default) 
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [user_id, type, street, city, state, country, postal_code, is_default || false]
+      [user_id, type || 'shipping', street, city, state || null, country, postal_code, is_default ? 1 : 0]
     );
 
     const [rows] = await pool.query('SELECT * FROM user_addresses WHERE id = ?', [result.insertId]);
@@ -206,7 +202,7 @@ class User {
     // If setting as default, unset other defaults
     if (is_default) {
       await pool.query(
-        'UPDATE user_addresses SET is_default = FALSE WHERE user_id = ? AND id != ?',
+        'UPDATE user_addresses SET is_default = 0 WHERE user_id = ? AND id != ?',
         [userId, id]
       );
     }
@@ -216,7 +212,7 @@ class User {
        type = ?, street = ?, city = ?, state = ?, country = ?, postal_code = ?, 
        is_default = ?, updated_at = CURRENT_TIMESTAMP 
        WHERE id = ? AND user_id = ?`,
-      [type, street, city, state, country, postal_code, is_default || false, id, userId]
+      [type, street, city, state, country, postal_code, is_default ? 1 : 0, id, userId]
     );
 
     if (result.affectedRows > 0) {
@@ -238,15 +234,13 @@ class User {
 
   // Set default address
   static async setDefaultAddress(id, userId) {
-    // Unset all defaults
     await pool.query(
-      'UPDATE user_addresses SET is_default = FALSE WHERE user_id = ?',
+      'UPDATE user_addresses SET is_default = 0 WHERE user_id = ?',
       [userId]
     );
 
-    // Set new default
     const [result] = await pool.query(
-      'UPDATE user_addresses SET is_default = TRUE WHERE id = ? AND user_id = ?',
+      'UPDATE user_addresses SET is_default = 1 WHERE id = ? AND user_id = ?',
       [id, userId]
     );
 
@@ -259,7 +253,7 @@ class User {
       `SELECT p.*, w.created_at as added_at 
        FROM wishlists w
        JOIN products p ON w.product_id = p.id
-       WHERE w.user_id = ? AND p.is_active = TRUE
+       WHERE w.user_id = ? AND p.is_active = 1
        ORDER BY w.created_at DESC`,
       [userId]
     );
@@ -273,11 +267,12 @@ class User {
         'INSERT IGNORE INTO wishlists (user_id, product_id) VALUES (?, ?)',
         [userId, productId]
       );
+      return true;
     } catch (error) {
-      // Ignore duplicate entry errors
       if (error.code !== 'ER_DUP_ENTRY') {
         throw error;
       }
+      return true;
     }
   }
 
@@ -305,7 +300,7 @@ class User {
   // Get user reviews
   static async getReviews(userId) {
     const [rows] = await pool.query(
-      `SELECT r.*, p.name as product_name, p.slug as product_slug
+      `SELECT r.*, p.name as product_name
        FROM reviews r
        JOIN products p ON r.product_id = p.id
        WHERE r.user_id = ?
@@ -332,7 +327,7 @@ class User {
       `INSERT INTO reviews 
        (product_id, user_id, user_name, user_email, rating, title, comment) 
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [product_id, user_id, user_name, user_email, rating, title, comment]
+      [product_id, user_id, user_name, user_email, rating, title || null, comment]
     );
 
     const [rows] = await pool.query('SELECT * FROM reviews WHERE id = ?', [result.insertId]);
@@ -369,27 +364,31 @@ class User {
 
   // Get user statistics
   static async getStats(userId) {
-    const [rows] = await pool.query(
+    const [orderStats] = await pool.query(
       `SELECT 
-        COUNT(DISTINCT o.id) as total_orders,
-        SUM(o.total_amount) as total_spent,
-        COUNT(DISTINCT w.product_id) as wishlist_count,
-        COUNT(DISTINCT r.id) as review_count,
-        AVG(r.rating) as average_rating
-       FROM users u
-       LEFT JOIN orders o ON u.id = o.user_id AND o.payment_status = 'paid'
-       LEFT JOIN wishlists w ON u.id = w.user_id
-       LEFT JOIN reviews r ON u.id = r.user_id
-       WHERE u.id = ?
-       GROUP BY u.id`,
+        COUNT(*) as total_orders,
+        SUM(total_amount) as total_spent
+       FROM orders 
+       WHERE user_id = ? AND payment_status = 'paid'`,
       [userId]
     );
-    return rows[0] || {
-      total_orders: 0,
-      total_spent: 0,
-      wishlist_count: 0,
-      review_count: 0,
-      average_rating: 0
+
+    const [wishlistCount] = await pool.query(
+      'SELECT COUNT(*) as count FROM wishlists WHERE user_id = ?',
+      [userId]
+    );
+
+    const [reviewStats] = await pool.query(
+      'SELECT COUNT(*) as count, AVG(rating) as avg_rating FROM reviews WHERE user_id = ?',
+      [userId]
+    );
+
+    return {
+      total_orders: orderStats[0]?.total_orders || 0,
+      total_spent: orderStats[0]?.total_spent || 0,
+      wishlist_count: wishlistCount[0]?.count || 0,
+      review_count: reviewStats[0]?.count || 0,
+      average_rating: reviewStats[0]?.avg_rating || 0
     };
   }
 }

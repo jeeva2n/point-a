@@ -1,4 +1,4 @@
-const pool = require('../config/database-mysql');
+const pool = require('../config/database');
 const crypto = require('crypto');
 
 class Product {
@@ -9,8 +9,10 @@ class Product {
       short_description,
       category,
       subcategory,
-      material,
+      materials,
       dimensions,
+      tolerance,
+      flaws,
       weight,
       standards,
       specifications,
@@ -36,136 +38,173 @@ class Product {
       .replace(/\s+/g, '-')
       .replace(/--+/g, '-');
 
+    // Handle materials array
+    let materialsJson = '[]';
+    if (materials) {
+      if (Array.isArray(materials)) {
+        materialsJson = JSON.stringify(materials);
+      } else if (typeof materials === 'string') {
+        try {
+          JSON.parse(materials);
+          materialsJson = materials;
+        } catch (e) {
+          materialsJson = JSON.stringify([materials]);
+        }
+      }
+    }
+
     const [result] = await pool.query(
       `INSERT INTO products 
        (name, slug, sku, description, short_description, category, subcategory, 
-        material, dimensions, weight, standards, specifications, features, 
+        materials, dimensions, tolerance, flaws, weight, standards, specifications, features, 
         image_url, type, price, compare_price, cost_price, stock_quantity,
         meta_title, meta_description, meta_keywords) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         name,
         slug,
         finalSku,
-        description,
-        short_description || description?.substring(0, 500),
+        description || null,
+        short_description || (description ? description.substring(0, 500) : null),
         category,
-        subcategory,
-        material,
-        dimensions,
-        weight,
-        standards,
-        typeof specifications === 'object' ? JSON.stringify(specifications) : null,
-        typeof features === 'object' ? JSON.stringify(features) : null,
-        image_url,
+        subcategory || null,
+        materialsJson,
+        dimensions || null,
+        tolerance || null,
+        flaws || null,
+        weight || null,
+        standards || null,
+        typeof specifications === 'object' ? JSON.stringify(specifications) : (specifications || null),
+        typeof features === 'object' ? JSON.stringify(features) : (features || null),
+        image_url || null,
         type,
-        price,
-        compare_price,
-        cost_price,
+        price || 0,
+        compare_price || null,
+        cost_price || null,
         stock_quantity || 0,
-        meta_title,
-        meta_description,
-        meta_keywords
+        meta_title || null,
+        meta_description || null,
+        meta_keywords || null
       ]
     );
-    
-    // Log activity
-    await this.logActivity('CREATE', 'products', result.insertId, null, productData);
     
     return this.findById(result.insertId);
   }
 
   static async findById(id) {
     const [rows] = await pool.query(
-      'SELECT * FROM products WHERE id = ? AND is_active = TRUE',
+      'SELECT * FROM products WHERE id = ? AND is_active = 1',
       [id]
     );
     
     if (!rows[0]) return null;
+
+    // Get images
+    const [images] = await pool.query(
+      'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
+      [id]
+    );
     
-    return this.parseJsonFields(rows[0]);
+    const product = this.parseJsonFields(rows[0]);
+    product.images = images.map(img => ({
+      id: img.id,
+      url: img.image_url,
+      isMain: img.is_main === 1,
+      sortOrder: img.sort_order
+    }));
+    product.mainImage = images.find(img => img.is_main === 1)?.image_url || product.image_url;
+    
+    return product;
   }
 
   static async findBySlug(slug) {
     const [rows] = await pool.query(
-      'SELECT * FROM products WHERE slug = ? AND is_active = TRUE',
+      'SELECT * FROM products WHERE slug = ? AND is_active = 1',
       [slug]
     );
     
     if (!rows[0]) return null;
+
+    const [images] = await pool.query(
+      'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
+      [rows[0].id]
+    );
     
-    return this.parseJsonFields(rows[0]);
+    const product = this.parseJsonFields(rows[0]);
+    product.images = images.map(img => ({
+      id: img.id,
+      url: img.image_url,
+      isMain: img.is_main === 1,
+      sortOrder: img.sort_order
+    }));
+    product.mainImage = images.find(img => img.is_main === 1)?.image_url || product.image_url;
+    
+    return product;
   }
 
-  static async findAll(filters = {}, page = 1, limit = 20) {
-    let query = `
-      SELECT p.*, 
-        COUNT(DISTINCT r.id) as review_count,
-        AVG(r.rating) as average_rating,
-        (SELECT image_url FROM product_images WHERE product_id = p.id AND is_main = TRUE LIMIT 1) as main_image
-      FROM products p
-      LEFT JOIN reviews r ON p.id = r.product_id AND r.is_approved = TRUE
-      WHERE p.is_active = TRUE
-    `;
-    
+  static async findAll(filters = {}, page = 1, limit = 20, sortField = 'created_at DESC') {
+    let query = 'SELECT * FROM products WHERE is_active = 1';
     const params = [];
-    const conditions = [];
     
     if (filters.type) {
-      conditions.push('p.type = ?');
+      query += ' AND type = ?';
       params.push(filters.type);
     }
     
     if (filters.category) {
-      conditions.push('p.category = ?');
+      query += ' AND category = ?';
       params.push(filters.category);
     }
     
     if (filters.subcategory) {
-      conditions.push('p.subcategory = ?');
+      query += ' AND subcategory = ?';
       params.push(filters.subcategory);
     }
     
     if (filters.min_price) {
-      conditions.push('p.price >= ?');
+      query += ' AND price >= ?';
       params.push(filters.min_price);
     }
     
     if (filters.max_price) {
-      conditions.push('p.price <= ?');
+      query += ' AND price <= ?';
       params.push(filters.max_price);
     }
     
     if (filters.featured === 'true') {
-      conditions.push('p.is_featured = TRUE');
+      query += ' AND is_featured = 1';
     }
-    
-    if (conditions.length > 0) {
-      query += ' AND ' + conditions.join(' AND ');
-    }
-    
-    // Add group by
-    query += ' GROUP BY p.id';
-    
-    // Calculate pagination
-    const offset = (page - 1) * limit;
     
     // Get total count
-    const countQuery = query.replace(
-      'SELECT p.*, COUNT(DISTINCT r.id) as review_count, AVG(r.rating) as average_rating',
-      'SELECT COUNT(DISTINCT p.id) as total'
-    );
+    const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
     const [countResult] = await pool.query(countQuery, params);
     const total = countResult[0]?.total || 0;
     
     // Add ordering and pagination
-    query += ' ORDER BY p.is_featured DESC, p.created_at DESC LIMIT ? OFFSET ?';
+    const offset = (page - 1) * limit;
+    query += ` ORDER BY ${sortField} LIMIT ? OFFSET ?`;
     params.push(limit, offset);
     
     const [rows] = await pool.query(query, params);
     
-    // Parse JSON fields
-    const products = rows.map(row => this.parseJsonFields(row));
+    // Get images for each product
+    const products = await Promise.all(rows.map(async row => {
+      const [images] = await pool.query(
+        'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
+        [row.id]
+      );
+      
+      const product = this.parseJsonFields(row);
+      product.images = images.map(img => ({
+        id: img.id,
+        url: img.image_url,
+        isMain: img.is_main === 1,
+        sortOrder: img.sort_order
+      }));
+      product.mainImage = images.find(img => img.is_main === 1)?.image_url || product.image_url;
+      
+      return product;
+    }));
     
     return {
       products,
@@ -184,49 +223,46 @@ class Product {
     }
     
     const offset = (page - 1) * limit;
+    const likeTerm = `%${searchTerm}%`;
     
     const [rows] = await pool.query(
-      `SELECT p.*, 
-        MATCH(p.name, p.description, p.material, p.standards) AGAINST(? IN NATURAL LANGUAGE MODE) as relevance,
-        COUNT(DISTINCT r.id) as review_count,
-        AVG(r.rating) as average_rating
-       FROM products p
-       LEFT JOIN reviews r ON p.id = r.product_id AND r.is_approved = TRUE
-       WHERE p.is_active = TRUE 
-       AND (MATCH(p.name, p.description, p.material, p.standards) AGAINST(? IN NATURAL LANGUAGE MODE)
-            OR p.name LIKE ? OR p.description LIKE ? OR p.material LIKE ? OR p.standards LIKE ?)
-       GROUP BY p.id
-       ORDER BY relevance DESC, p.created_at DESC
+      `SELECT * FROM products 
+       WHERE is_active = 1 
+       AND (name LIKE ? OR description LIKE ? OR materials LIKE ? OR standards LIKE ? OR category LIKE ?)
+       ORDER BY 
+         CASE WHEN name LIKE ? THEN 1 ELSE 2 END,
+         created_at DESC
        LIMIT ? OFFSET ?`,
-      [
-        searchTerm,
-        searchTerm,
-        `%${searchTerm}%`,
-        `%${searchTerm}%`,
-        `%${searchTerm}%`,
-        `%${searchTerm}%`,
-        limit,
-        offset
-      ]
+      [likeTerm, likeTerm, likeTerm, likeTerm, likeTerm, likeTerm, limit, offset]
     );
     
     const [countResult] = await pool.query(
-      `SELECT COUNT(DISTINCT p.id) as total
-       FROM products p
-       WHERE p.is_active = TRUE 
-       AND (MATCH(p.name, p.description, p.material, p.standards) AGAINST(? IN NATURAL LANGUAGE MODE)
-            OR p.name LIKE ? OR p.description LIKE ? OR p.material LIKE ? OR p.standards LIKE ?)`,
-      [
-        searchTerm,
-        `%${searchTerm}%`,
-        `%${searchTerm}%`,
-        `%${searchTerm}%`,
-        `%${searchTerm}%`
-      ]
+      `SELECT COUNT(*) as total FROM products 
+       WHERE is_active = 1 
+       AND (name LIKE ? OR description LIKE ? OR materials LIKE ? OR standards LIKE ? OR category LIKE ?)`,
+      [likeTerm, likeTerm, likeTerm, likeTerm, likeTerm]
     );
     
     const total = countResult[0]?.total || 0;
-    const products = rows.map(row => this.parseJsonFields(row));
+    
+    // Get images for each product
+    const products = await Promise.all(rows.map(async row => {
+      const [images] = await pool.query(
+        'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
+        [row.id]
+      );
+      
+      const product = this.parseJsonFields(row);
+      product.images = images.map(img => ({
+        id: img.id,
+        url: img.image_url,
+        isMain: img.is_main === 1,
+        sortOrder: img.sort_order
+      }));
+      product.mainImage = images.find(img => img.is_main === 1)?.image_url || product.image_url;
+      
+      return product;
+    }));
     
     return {
       products,
@@ -246,15 +282,16 @@ class Product {
     const updateFields = [];
     const updateValues = [];
     
-    // Build dynamic update query
     const fieldMapping = {
       name: 'name',
       description: 'description',
       short_description: 'short_description',
       category: 'category',
       subcategory: 'subcategory',
-      material: 'material',
+      materials: 'materials',
       dimensions: 'dimensions',
+      tolerance: 'tolerance',
+      flaws: 'flaws',
       weight: 'weight',
       standards: 'standards',
       specifications: 'specifications',
@@ -277,8 +314,16 @@ class Product {
         let value = productData[key];
         
         // Handle JSON fields
-        if (['specifications', 'features'].includes(key) && typeof value === 'object') {
-          value = JSON.stringify(value);
+        if (['specifications', 'features', 'materials'].includes(key)) {
+          if (typeof value === 'object') {
+            value = JSON.stringify(value);
+          } else if (typeof value === 'string' && key === 'materials') {
+            try {
+              JSON.parse(value);
+            } catch (e) {
+              value = JSON.stringify([value]);
+            }
+          }
         }
         
         updateFields.push(`${dbField} = ?`);
@@ -301,8 +346,6 @@ class Product {
     );
 
     if (result.affectedRows > 0) {
-      // Log activity
-      await this.logActivity('UPDATE', 'products', id, oldProduct, productData, adminId);
       return this.findById(id);
     }
     
@@ -314,17 +357,102 @@ class Product {
     if (!product) return false;
 
     const [result] = await pool.query(
-      'UPDATE products SET is_active = FALSE WHERE id = ?',
+      'UPDATE products SET is_active = 0 WHERE id = ?',
       [id]
     );
 
-    if (result.affectedRows > 0) {
-      // Log activity
-      await this.logActivity('DELETE', 'products', id, product, null, adminId);
-      return true;
+    return result.affectedRows > 0;
+  }
+
+  static async addImages(productId, images) {
+    const [maxOrder] = await pool.query(
+      'SELECT MAX(sort_order) as max_order FROM product_images WHERE product_id = ?',
+      [productId]
+    );
+    let sortOrder = (maxOrder[0].max_order || -1) + 1;
+
+    const [existingImages] = await pool.query(
+      'SELECT COUNT(*) as count FROM product_images WHERE product_id = ?',
+      [productId]
+    );
+    const isFirstImage = existingImages[0].count === 0;
+
+    const insertedImages = [];
+    for (let i = 0; i < images.length; i++) {
+      const isMain = isFirstImage && i === 0 ? 1 : 0;
+      
+      const [result] = await pool.query(
+        `INSERT INTO product_images (product_id, image_url, is_main, sort_order)
+         VALUES (?, ?, ?, ?)`,
+        [productId, images[i], isMain, sortOrder + i]
+      );
+
+      insertedImages.push({
+        id: result.insertId,
+        url: images[i],
+        isMain: isMain === 1,
+        sortOrder: sortOrder + i
+      });
+
+      if (isMain) {
+        await pool.query('UPDATE products SET image_url = ? WHERE id = ?', [images[i], productId]);
+      }
     }
-    
-    return false;
+
+    return insertedImages;
+  }
+
+  static async deleteImage(productId, imageId) {
+    const [images] = await pool.query(
+      'SELECT * FROM product_images WHERE id = ? AND product_id = ?',
+      [imageId, productId]
+    );
+
+    if (images.length === 0) return null;
+
+    const image = images[0];
+    await pool.query('DELETE FROM product_images WHERE id = ?', [imageId]);
+
+    if (image.is_main === 1) {
+      const [remainingImages] = await pool.query(
+        'SELECT id, image_url FROM product_images WHERE product_id = ? ORDER BY sort_order ASC LIMIT 1',
+        [productId]
+      );
+
+      if (remainingImages.length > 0) {
+        await pool.query('UPDATE product_images SET is_main = 1 WHERE id = ?', [remainingImages[0].id]);
+        await pool.query('UPDATE products SET image_url = ? WHERE id = ?', [remainingImages[0].image_url, productId]);
+      } else {
+        await pool.query('UPDATE products SET image_url = NULL WHERE id = ?', [productId]);
+      }
+    }
+
+    return image.image_url;
+  }
+
+  static async setMainImage(productId, imageId) {
+    const [images] = await pool.query(
+      'SELECT image_url FROM product_images WHERE id = ? AND product_id = ?',
+      [imageId, productId]
+    );
+
+    if (images.length === 0) return false;
+
+    await pool.query('UPDATE product_images SET is_main = 0 WHERE product_id = ?', [productId]);
+    await pool.query('UPDATE product_images SET is_main = 1 WHERE id = ?', [imageId]);
+    await pool.query('UPDATE products SET image_url = ? WHERE id = ?', [images[0].image_url, productId]);
+
+    return true;
+  }
+
+  static async reorderImages(productId, imageOrder) {
+    for (let i = 0; i < imageOrder.length; i++) {
+      await pool.query(
+        'UPDATE product_images SET sort_order = ? WHERE id = ? AND product_id = ?',
+        [i, imageOrder[i], productId]
+      );
+    }
+    return true;
   }
 
   static async getCategories() {
@@ -336,11 +464,19 @@ class Product {
         MIN(price) as min_price,
         MAX(price) as max_price
        FROM products 
-       WHERE is_active = TRUE 
+       WHERE is_active = 1 
        GROUP BY category, type 
        ORDER BY category, type`
     );
     return rows;
+  }
+
+  static async getCountByCategory(categoryName) {
+    const [rows] = await pool.query(
+      'SELECT COUNT(*) as count FROM products WHERE category = ? AND is_active = 1',
+      [categoryName]
+    );
+    return rows[0]?.count || 0;
   }
 
   static async getRelatedProducts(productId, limit = 4) {
@@ -348,27 +484,28 @@ class Product {
     if (!product) return [];
 
     const [rows] = await pool.query(
-      `SELECT p.*
-       FROM products p
-       WHERE p.is_active = TRUE 
-       AND p.id != ?
-       AND (p.category = ? OR p.type = ?)
+      `SELECT * FROM products
+       WHERE is_active = 1 
+       AND id != ?
+       AND (category = ? OR type = ?)
        ORDER BY 
-         CASE WHEN p.category = ? THEN 1 ELSE 2 END,
-         CASE WHEN p.type = ? THEN 1 ELSE 2 END,
-         p.created_at DESC
+         CASE WHEN category = ? THEN 1 ELSE 2 END,
+         CASE WHEN type = ? THEN 1 ELSE 2 END,
+         created_at DESC
        LIMIT ?`,
       [productId, product.category, product.type, product.category, product.type, limit]
     );
     
-    return rows.map(row => this.parseJsonFields(row));
-  }
-
-  static async incrementViewCount(id) {
-    await pool.query(
-      'UPDATE products SET view_count = view_count + 1 WHERE id = ?',
-      [id]
-    );
+    return Promise.all(rows.map(async row => {
+      const [images] = await pool.query(
+        'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC LIMIT 1',
+        [row.id]
+      );
+      
+      const parsed = this.parseJsonFields(row);
+      parsed.mainImage = images[0]?.image_url || row.image_url;
+      return parsed;
+    }));
   }
 
   static async updateStock(id, quantity) {
@@ -382,17 +519,25 @@ class Product {
 
   // Helper method to parse JSON fields
   static parseJsonFields(row) {
-    const jsonFields = ['specifications', 'features', 'documents'];
+    const jsonFields = ['specifications', 'features', 'materials'];
     
     jsonFields.forEach(field => {
       if (row[field] && typeof row[field] === 'string') {
         try {
           row[field] = JSON.parse(row[field]);
         } catch (e) {
-          row[field] = {};
+          if (field === 'materials') {
+            row[field] = [];
+          } else {
+            row[field] = {};
+          }
         }
       } else if (!row[field]) {
-        row[field] = {};
+        if (field === 'materials') {
+          row[field] = [];
+        } else {
+          row[field] = {};
+        }
       }
     });
     
@@ -408,41 +553,16 @@ class Product {
     return row;
   }
 
-  // Activity logging
-  static async logActivity(action, tableName, recordId, oldData, newData, adminId = null) {
-    try {
-      await pool.query(
-        `INSERT INTO audit_logs 
-         (admin_id, action, table_name, record_id, old_data, new_data, ip_address) 
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          adminId,
-          action,
-          tableName,
-          recordId,
-          oldData ? JSON.stringify(oldData) : null,
-          newData ? JSON.stringify(newData) : null,
-          // IP would come from request context in controller
-          null
-        ]
-      );
-    } catch (error) {
-      console.error('Failed to log activity:', error);
-    }
-  }
-
-  // Get product statistics
   static async getStats() {
     const [results] = await pool.query(`
       SELECT 
         COUNT(*) as total_products,
-        SUM(CASE WHEN is_featured = TRUE THEN 1 ELSE 0 END) as featured_products,
-        SUM(CASE WHEN stock_quantity <= low_stock_threshold THEN 1 ELSE 0 END) as low_stock_products,
+        SUM(CASE WHEN is_featured = 1 THEN 1 ELSE 0 END) as featured_products,
+        SUM(CASE WHEN stock_quantity <= 5 THEN 1 ELSE 0 END) as low_stock_products,
         SUM(CASE WHEN stock_quantity = 0 THEN 1 ELSE 0 END) as out_of_stock_products,
-        AVG(price) as average_price,
-        SUM(view_count) as total_views
+        AVG(price) as average_price
       FROM products 
-      WHERE is_active = TRUE
+      WHERE is_active = 1
     `);
     
     return results[0];

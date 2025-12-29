@@ -8,7 +8,7 @@ async function seedDatabase() {
     
     // 1. Seed Admin
     console.log('👤 Creating admin user...');
-    const adminPassword = await bcrypt.hash('Admin123!', 12);
+    const adminPassword = await bcrypt.hash('Admin123!z', 12);
     await pool.query(
       `INSERT IGNORE INTO admins (username, password, email, role) 
        VALUES (?, ?, ?, ?)`,
@@ -241,7 +241,7 @@ async function seedDatabase() {
     console.log('\n🔐 Admin Login:');
     console.log('  URL: http://localhost:5000/api/admin/login');
     console.log('  Username: admin');
-    console.log('  Password: Admin123!');
+    console.log('  Password: Admin123!z');
     
     // Show API endpoints
     console.log('\n🌐 API Endpoints:');
@@ -256,5 +256,20 @@ async function seedDatabase() {
     await pool.end();
   }
 }
+// scripts/seed.js - Add this
+const bcrypt = require('bcrypt');
 
+async function createDefaultAdmin() {
+  const hashedPassword = await bcrypt.hash('admin123z', 10);
+  
+  await db.query(
+    `INSERT IGNORE INTO admins (username, password, email, role) 
+     VALUES (?, ?, ?, ?)`,
+    ['admin', hashedPassword, 'admin@daksndt.com', 'super_admin']
+  );
+  
+  console.log('✅ Default admin created');
+  console.log('Username: admin');
+  console.log('Password: admin123z');
+}
 seedDatabase();

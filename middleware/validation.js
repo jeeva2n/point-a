@@ -1,16 +1,59 @@
 const { body, validationResult } = require('express-validator');
+const { hasPermission } = require('./auth');
 
 const validateProduct = [
   body('name').notEmpty().withMessage('Product name is required').trim(),
-  body('description').notEmpty().withMessage('Description is required').trim(),
+  body('description').optional().trim(),
   body('category').notEmpty().withMessage('Category is required').trim(),
-  body('type').isIn(['calibration_block', 'flawed_specimen', 'validation_block', 'ndt_kit']).withMessage('Invalid product type'),
-  body('material').optional().trim(),
-  body('dimensions').optional().trim(),
-  body('standards').optional().trim(),
+  body('type').isIn(['calibration_block', 'flawed_specimen', 'validation_block', 'ndt_kit', 'accessory', 'other']).withMessage('Invalid product type'),
   body('price').optional().isFloat({ min: 0 }).withMessage('Price must be a positive number'),
-  body('specifications').optional().isObject().withMessage('Specifications must be an object'),
-  
+  body('dimensions').optional().trim(),
+  body('tolerance').optional().trim(),
+  body('flaws').optional().trim(),
+  body('materials').optional(),
+  body('specifications').optional(),
+
+  (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation errors',
+        errors: errors.array()
+      });
+    }
+    next();
+  }
+];
+
+const validateCategory = [
+  body('name').notEmpty().withMessage('Category name is required').trim(),
+  body('slug').optional().trim(),
+  body('description').optional().trim(),
+  body('parent_id').optional().isInt().withMessage('Parent ID must be an integer'),
+  body('sort_order').optional().isInt().withMessage('Sort order must be an integer'),
+
+  (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation errors',
+        errors: errors.array()
+      });
+    }
+    next();
+  }
+];
+
+const validateOrder = [
+  body('customer_email').isEmail().withMessage('Valid email is required'),
+  body('customer_name').notEmpty().withMessage('Customer name is required').trim(),
+  body('items').isArray({ min: 1 }).withMessage('At least one item is required'),
+  body('items.*.product_id').isInt().withMessage('Product ID must be an integer'),
+  body('items.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+  body('shipping_address').notEmpty().withMessage('Shipping address is required'),
+
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -27,7 +70,7 @@ const validateProduct = [
 const validateLogin = [
   body('username').notEmpty().withMessage('Username is required').trim(),
   body('password').notEmpty().withMessage('Password is required'),
-  
+
   (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -41,4 +84,52 @@ const validateLogin = [
   }
 ];
 
-module.exports = { validateProduct, validateLogin };
+const validateUserRegistration = [
+  body('email').isEmail().withMessage('Valid email is required').normalizeEmail(),
+  body('password')
+    .isLength({ min: 8 }).withMessage('Password must be at least 8 characters')
+    .matches(/[A-Z]/).withMessage('Password must contain at least one uppercase letter')
+    .matches(/[a-z]/).withMessage('Password must contain at least one lowercase letter')
+    .matches(/[0-9]/).withMessage('Password must contain at least one number'),
+  body('full_name').notEmpty().withMessage('Full name is required').trim(),
+  body('company').optional().trim(),
+  body('phone').optional().trim(),
+
+  (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation errors',
+        errors: errors.array()
+      });
+    }
+    next();
+  }
+];
+
+const validateUserLogin = [
+  body('email').isEmail().withMessage('Valid email is required').normalizeEmail(),
+  body('password').notEmpty().withMessage('Password is required'),
+
+  (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation errors',
+        errors: errors.array()
+      });
+    }
+    next();
+  }
+];
+
+module.exports = {
+  validateProduct,
+  validateCategory,
+  validateOrder,
+  validateLogin,
+  validateUserRegistration,
+  validateUserLogin
+};

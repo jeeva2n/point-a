@@ -1,48 +1,25 @@
 // routes/adminRoutes.js
 const express = require('express');
 const router = express.Router();
+const adminController = require('../controllers/adminController');
+const { auth } = require('../middleware/auth');
 
-// Temporary test route
-router.get('/test', (req, res) => {
-  res.json({ message: 'Admin routes working!' });
-});
+// Public routes
+router.post('/login', adminController.login);
 
-// Simple login route
-router.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  
-  // Simple validation for development
-  if (username === 'admin' && password === 'admin123') {
-    return res.json({
-      success: true,
-      message: 'Login successful',
-      token: 'dummy-token-for-dev',
-      admin: {
-        id: 1,
-        username: 'admin',
-        email: 'admin@daksndt.com',
-        role: 'super_admin'
-      }
-    });
-  }
-  
-  res.status(401).json({
-    success: false,
-    message: 'Invalid credentials'
-  });
-});
-
-// Protected routes placeholder
-router.get('/profile', (req, res) => {
+// Verify token (public - checks if token is valid)
+router.get('/verify', auth, (req, res) => {
   res.json({
     success: true,
-    admin: {
-      id: 1,
-      username: 'admin',
-      email: 'admin@daksndt.com',
-      role: 'super_admin'
-    }
+    admin: req.admin
   });
 });
+
+// Protected routes (require authentication)
+router.get('/profile', auth, adminController.getProfile);
+
+// Admin management (optional - for super admins)
+// router.get('/list', auth, adminController.getAllAdmins);
+// router.put('/:id/toggle-status', auth, adminController.toggleAdminStatus);
 
 module.exports = router;

@@ -88,14 +88,14 @@ async function resetDatabase() {
     // Insert default admin
     console.log('👤 Creating default admin...');
     const bcrypt = require('bcryptjs');
-    const hashedPassword = await bcrypt.hash('admin123', 10);
+    const hashedPassword = await bcrypt.hash('admin123z', 10);
     
     try {
       await connection.query(
         'INSERT INTO admins (username, password, email, role) VALUES (?, ?, ?, ?)',
         ['admin', hashedPassword, 'admin@daksndt.com', 'super_admin']
       );
-      console.log('✅ Default admin created: admin / admin123');
+      console.log('✅ Default admin created: admin / admin123z');
     } catch (error) {
       if (error.code === 'ER_DUP_ENTRY') {
         console.log('✅ Admin already exists');

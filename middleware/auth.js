@@ -1,230 +1,108 @@
-const Admin = require('../models/Admin');
 const jwt = require('jsonwebtoken');
-const rateLimit = require('express-rate-limit');
-
-// Rate limiting for auth endpoints
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 attempts per window
-  message: {
-    success: false,
-    message: 'Too many login attempts. Please try again later.'
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipSuccessfulRequests: true
-});
+const pool = require('../config/database');
 
 const auth = async (req, res, next) => {
   try {
-    const authHeader = req.header('Authorization');
-    
-    if (!authHeader) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({
         success: false,
-        code: 'NO_TOKEN',
         message: 'Access denied. No token provided.'
       });
     }
 
-    // Check Bearer token format
-    if (!authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        code: 'INVALID_TOKEN_FORMAT',
-        message: 'Invalid token format. Use: Bearer <token>'
-      });
-    }
+    const token = authHeader.split(' ')[1];
 
-    const token = authHeader.replace('Bearer ', '').trim();
-    
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        code: 'EMPTY_TOKEN',
-        message: 'Token cannot be empty'
-      });
-    }
-
-    // Verify token
-    let decoded;
     try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (error) {
-      if (error.name === 'TokenExpiredError') {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+
+      // Check if admin exists and is active
+      const [admins] = await pool.query(
+        'SELECT id, username, email, role, is_active FROM admins WHERE id = ?',
+        [decoded.id]
+      );
+
+      if (admins.length === 0) {
         return res.status(401).json({
           success: false,
-          code: 'TOKEN_EXPIRED',
-          message: 'Token has expired. Please login again.'
+          message: 'Invalid token. Admin not found.'
         });
       }
-      if (error.name === 'JsonWebTokenError') {
-        return res.status(401).json({
-          success: false,
-          code: 'INVALID_TOKEN',
-          message: 'Invalid token.'
-        });
-      }
-      throw error;
-    }
 
-    // Check token blacklist (if implemented)
-    // await checkTokenBlacklist(token);
+      const admin = admins[0];
 
-    // Get admin from database
-    const admin = await Admin.findById(decoded.id);
-    
-    if (!admin) {
-      return res.status(401).json({
-        success: false,
-        code: 'ADMIN_NOT_FOUND',
-        message: 'Admin account not found or disabled.'
-      });
-    }
-
-    // Check if admin is active
-    if (!admin.is_active) {
-      return res.status(403).json({
-        success: false,
-        code: 'ACCOUNT_DISABLED',
-        message: 'Your account has been disabled.'
-      });
-    }
-
-    // Check if password was changed after token was issued
-    if (decoded.iat < Math.floor(admin.password_changed_at / 1000)) {
-      return res.status(401).json({
-        success: false,
-        code: 'PASSWORD_CHANGED',
-        message: 'Password was changed. Please login again.'
-      });
-    }
-
-    // Attach admin to request
-    req.admin = {
-      id: admin.id,
-      username: admin.username,
-      email: admin.email,
-      role: admin.role,
-      permissions: admin.permissions || []
-    };
-    
-    req.token = token;
-    req.tokenExpiry = decoded.exp;
-
-    // Log successful authentication (optional)
-    // await logAuthSuccess(req);
-
-    next();
-  } catch (error) {
-    console.error('Auth error:', error);
-    
-    // Don't expose internal errors
-    res.status(500).json({
-      success: false,
-      code: 'AUTH_ERROR',
-      message: 'Authentication failed'
-    });
-  }
-};
-
-const isSuperAdmin = async (req, res, next) => {
-  try {
-    if (req.admin.role !== 'super_admin') {
-      return res.status(403).json({
-        success: false,
-        code: 'ACCESS_DENIED',
-        message: 'Access denied. Super admin privileges required.'
-      });
-    }
-    next();
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      code: 'SERVER_ERROR',
-      message: 'Server error checking permissions'
-    });
-  }
-};
-
-const hasPermission = (requiredPermission) => {
-  return async (req, res, next) => {
-    try {
-      if (req.admin.role === 'super_admin') {
-        return next();
-      }
-
-      const admin = await Admin.findById(req.admin.id);
-      
-      if (!admin.permissions || !admin.permissions.includes(requiredPermission)) {
+      if (!admin.is_active) {
         return res.status(403).json({
           success: false,
-          code: 'PERMISSION_DENIED',
-          message: `Required permission: ${requiredPermission}`
+          message: 'Account is disabled.'
         });
       }
-      
+
+      req.admin = admin;
       next();
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        code: 'SERVER_ERROR',
-        message: 'Server error checking permissions'
-      });
+    } catch (jwtError) {
+      if (jwtError.name === 'TokenExpiredError') {
+        return res.status(401).json({
+          success: false,
+          message: 'Token expired. Please login again.'
+        });
+      }
+      throw jwtError;
     }
-  };
+  } catch (error) {
+    console.error('Auth middleware error:', error);
+    res.status(401).json({
+      success: false,
+      message: 'Invalid token.'
+    });
+  }
 };
 
-// Optional: IP whitelisting middleware
-const ipWhitelist = (allowedIPs = []) => {
+const hasPermission = (permission) => {
   return (req, res, next) => {
-    const clientIP = req.ip || req.connection.remoteAddress;
-    
-    // Extract IP from X-Forwarded-For header if behind proxy
-    const forwardedIP = req.headers['x-forwarded-for']?.split(',')[0];
-    const realIP = forwardedIP || clientIP;
-    
-    if (allowedIPs.length > 0 && !allowedIPs.includes(realIP)) {
-      return res.status(403).json({
+    if (!req.admin) {
+      return res.status(401).json({
         success: false,
-        code: 'IP_NOT_ALLOWED',
-        message: 'Access from your IP address is not allowed.'
+        message: 'Authentication required.'
       });
     }
-    
-    next();
+
+    // Define role permissions
+    const rolePermissions = {
+      super_admin: ['*'],
+      admin: [
+        'manage_products',
+        'manage_categories',
+        'view_orders',
+        'update_orders',
+        'manage_orders',
+        'view_reports',
+        'manage_refunds',
+        'view_refunds'
+      ],
+      editor: [
+        'manage_products',
+        'manage_categories',
+        'view_orders'
+      ],
+      viewer: [
+        'view_orders',
+        'view_reports'
+      ]
+    };
+
+    const userPermissions = rolePermissions[req.admin.role] || [];
+
+    if (userPermissions.includes('*') || userPermissions.includes(permission)) {
+      next();
+    } else {
+      res.status(403).json({
+        success: false,
+        message: 'Permission denied.'
+      });
+    }
   };
 };
 
-// CSRF protection for non-API routes
-const csrfProtection = (req, res, next) => {
-  // Skip for API routes
-  if (req.path.startsWith('/api/')) {
-    return next();
-  }
-  
-  // Validate CSRF token for form submissions
-  if (req.method === 'POST' || req.method === 'PUT' || req.method === 'DELETE') {
-    const csrfToken = req.headers['x-csrf-token'] || req.body._csrf;
-    const sessionToken = req.session?.csrfToken;
-    
-    if (!csrfToken || csrfToken !== sessionToken) {
-      return res.status(403).json({
-        success: false,
-        code: 'CSRF_TOKEN_INVALID',
-        message: 'Invalid CSRF token'
-      });
-    }
-  }
-  
-  next();
-};
-
-module.exports = { 
-  auth, 
-  isSuperAdmin, 
-  hasPermission, 
-  authLimiter,
-  ipWhitelist,
-  csrfProtection 
-};
+module.exports = { auth, hasPermission };

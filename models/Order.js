@@ -1,5 +1,4 @@
-const pool = require('../config/database-mysql');
-const crypto = require('crypto');
+const pool = require('../config/database');
 
 class Order {
   // Create new order
@@ -31,21 +30,21 @@ class Order {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         order_number,
-        user_id,
+        user_id || null,
         customer_email,
         customer_name,
-        customer_company,
-        customer_phone,
+        customer_company || null,
+        customer_phone || null,
         typeof shipping_address === 'object' ? JSON.stringify(shipping_address) : shipping_address,
         typeof billing_address === 'object' ? JSON.stringify(billing_address) : billing_address,
         typeof items === 'object' ? JSON.stringify(items) : items,
-        subtotal,
+        subtotal || 0,
         tax_amount || 0,
         shipping_amount || 0,
         discount_amount || 0,
         total_amount,
-        payment_method,
-        notes
+        payment_method || null,
+        notes || null
       ]
     );
 
@@ -60,7 +59,7 @@ class Order {
             result.insertId,
             item.product_id,
             item.product_name,
-            item.product_sku,
+            item.product_sku || null,
             item.quantity,
             item.unit_price,
             item.total_price,
@@ -75,34 +74,23 @@ class Order {
 
   // Find order by ID
   static async findById(id) {
-    const [rows] = await pool.query(
-      `SELECT o.*, 
-        JSON_ARRAYAGG(
-          JSON_OBJECT(
-            'id', oi.id,
-            'product_id', oi.product_id,
-            'product_name', oi.product_name,
-            'product_sku', oi.product_sku,
-            'quantity', oi.quantity,
-            'unit_price', oi.unit_price,
-            'total_price', oi.total_price,
-            'specifications', oi.specifications
-          )
-        ) as items
-       FROM orders o
-       LEFT JOIN order_items oi ON o.id = oi.order_id
-       WHERE o.id = ?
-       GROUP BY o.id`,
-      [id]
-    );
+    const [rows] = await pool.query('SELECT * FROM orders WHERE id = ?', [id]);
 
     if (!rows[0]) return null;
 
-    // Parse JSON fields
+    // Get order items
+    const [items] = await pool.query(
+      'SELECT * FROM order_items WHERE order_id = ?',
+      [id]
+    );
+
     const order = rows[0];
     order.shipping_address = this.parseJson(order.shipping_address);
     order.billing_address = this.parseJson(order.billing_address);
-    order.items = this.parseJson(order.items) || [];
+    order.items = items.map(item => ({
+      ...item,
+      specifications: this.parseJson(item.specifications)
+    }));
 
     return order;
   }
@@ -174,21 +162,13 @@ class Order {
 
   // Get user orders
   static async getUserOrders(userId, page = 1, limit = 10) {
-    const query = `
-      SELECT o.*, 
-        COUNT(oi.id) as item_count,
-        SUM(oi.total_price) as items_total
-      FROM orders o
-      LEFT JOIN order_items oi ON o.id = oi.order_id
-      WHERE o.user_id = ?
-      GROUP BY o.id
-      ORDER BY o.created_at DESC
-      LIMIT ? OFFSET ?
-    `;
+    const offset = (page - 1) * limit;
 
-    const [rows] = await pool.query(query, [userId, limit, (page - 1) * limit]);
+    const [rows] = await pool.query(
+      `SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      [userId, limit, offset]
+    );
 
-    // Get total count
     const [countResult] = await pool.query(
       'SELECT COUNT(*) as total FROM orders WHERE user_id = ?',
       [userId]
@@ -209,44 +189,39 @@ class Order {
   // Get user order by ID
   static async getUserOrderById(orderId, userId) {
     const [rows] = await pool.query(
-      `SELECT o.*, 
-        JSON_ARRAYAGG(
-          JSON_OBJECT(
-            'id', oi.id,
-            'product_id', oi.product_id,
-            'product_name', oi.product_name,
-            'product_sku', oi.product_sku,
-            'quantity', oi.quantity,
-            'unit_price', oi.unit_price,
-            'total_price', oi.total_price,
-            'specifications', oi.specifications
-          )
-        ) as items
-       FROM orders o
-       LEFT JOIN order_items oi ON o.id = oi.order_id
-       WHERE o.id = ? AND (o.user_id = ? OR ? IS NULL)
-       GROUP BY o.id`,
-      [orderId, userId, userId]
+      'SELECT * FROM orders WHERE id = ? AND user_id = ?',
+      [orderId, userId]
     );
 
     if (!rows[0]) return null;
 
+    const [items] = await pool.query(
+      'SELECT * FROM order_items WHERE order_id = ?',
+      [orderId]
+    );
+
     const order = rows[0];
     order.shipping_address = this.parseJson(order.shipping_address);
     order.billing_address = this.parseJson(order.billing_address);
-    order.items = this.parseJson(order.items) || [];
+    order.items = items;
 
     return order;
   }
 
   // Update order status
   static async updateStatus(id, status, notes = null) {
-    const [result] = await pool.query(
-      `UPDATE orders SET 
-       order_status = ?, notes = CONCAT(IFNULL(notes, ''), ?), updated_at = CURRENT_TIMESTAMP 
-       WHERE id = ?`,
-      [status, notes ? `\nStatus changed to ${status}: ${notes}` : '', id]
-    );
+    let query = 'UPDATE orders SET order_status = ?, updated_at = CURRENT_TIMESTAMP';
+    const params = [status];
+
+    if (notes) {
+      query += ', notes = CONCAT(IFNULL(notes, ""), ?)';
+      params.push(`\n[${new Date().toISOString()}] Status: ${status} - ${notes}`);
+    }
+
+    query += ' WHERE id = ?';
+    params.push(id);
+
+    const [result] = await pool.query(query, params);
 
     if (result.affectedRows > 0) {
       return this.findById(id);
@@ -280,7 +255,7 @@ class Order {
        shipped_at = CURRENT_TIMESTAMP,
        updated_at = CURRENT_TIMESTAMP 
        WHERE id = ?`,
-      [trackingNumber, carrier, estimatedDelivery, id]
+      [trackingNumber, carrier, estimatedDelivery || null, id]
     );
 
     if (result.affectedRows > 0) {
@@ -292,24 +267,18 @@ class Order {
 
   // Cancel order
   static async cancelOrder(id, userId = null) {
-    const conditions = ['id = ?'];
+    let query = 'UPDATE orders SET order_status = "cancelled", updated_at = CURRENT_TIMESTAMP WHERE id = ?';
     const params = [id];
 
     if (userId !== null) {
-      conditions.push('user_id = ?');
+      query = 'UPDATE orders SET order_status = "cancelled", updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?';
       params.push(userId);
     }
 
-    const [result] = await pool.query(
-      `UPDATE orders SET 
-       order_status = 'cancelled',
-       updated_at = CURRENT_TIMESTAMP 
-       WHERE ${conditions.join(' AND ')}`,
-      params
-    );
+    const [result] = await pool.query(query, params);
 
     if (result.affectedRows > 0) {
-      return this.getUserOrderById(id, userId);
+      return userId ? this.getUserOrderById(id, userId) : this.findById(id);
     }
     
     return null;
@@ -349,35 +318,34 @@ class Order {
     let interval;
     switch (period) {
       case 'day':
-        interval = '1 DAY';
+        interval = 'INTERVAL 1 DAY';
         break;
       case 'week':
-        interval = '7 DAY';
+        interval = 'INTERVAL 7 DAY';
         break;
       case 'year':
-        interval = '1 YEAR';
+        interval = 'INTERVAL 1 YEAR';
         break;
-      default: // month
-        interval = '30 DAY';
+      default:
+        interval = 'INTERVAL 30 DAY';
     }
 
     const [rows] = await pool.query(
       `SELECT 
         COUNT(*) as total_orders,
-        SUM(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL ${interval}) THEN total_amount ELSE 0 END) as recent_revenue,
+        SUM(total_amount) as total_revenue,
         AVG(total_amount) as average_order_value,
         COUNT(DISTINCT customer_email) as unique_customers,
         SUM(CASE WHEN order_status = 'delivered' THEN 1 ELSE 0 END) as delivered_orders,
         SUM(CASE WHEN order_status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_orders,
-        (SELECT COUNT(*) FROM orders WHERE payment_status = 'pending') as pending_payments
+        SUM(CASE WHEN payment_status = 'pending' THEN 1 ELSE 0 END) as pending_payments
        FROM orders 
-       WHERE created_at >= DATE_SUB(NOW(), INTERVAL ${interval})`,
-      []
+       WHERE created_at >= DATE_SUB(NOW(), ${interval})`
     );
 
     return rows[0] || {
       total_orders: 0,
-      recent_revenue: 0,
+      total_revenue: 0,
       average_order_value: 0,
       unique_customers: 0,
       delivered_orders: 0,
@@ -389,14 +357,7 @@ class Order {
   // Get recent orders
   static async getRecent(limit = 10) {
     const [rows] = await pool.query(
-      `SELECT o.*, 
-        COUNT(oi.id) as item_count,
-        SUM(oi.total_price) as items_total
-       FROM orders o
-       LEFT JOIN order_items oi ON o.id = oi.order_id
-       GROUP BY o.id
-       ORDER BY o.created_at DESC
-       LIMIT ?`,
+      'SELECT * FROM orders ORDER BY created_at DESC LIMIT ?',
       [limit]
     );
     return rows;
@@ -418,7 +379,7 @@ class Order {
       case 'year':
         dateFormat = '%Y';
         break;
-      default: // day
+      default:
         dateFormat = '%Y-%m-%d';
     }
 
@@ -455,15 +416,12 @@ class Order {
   static async getProductSalesReport(startDate, endDate, limit = 20) {
     let query = `
       SELECT 
-        p.id,
-        p.name,
-        p.sku,
-        p.category,
-        COUNT(oi.id) as units_sold,
+        oi.product_id,
+        oi.product_name,
+        SUM(oi.quantity) as units_sold,
         SUM(oi.total_price) as revenue,
         AVG(oi.unit_price) as average_price
       FROM order_items oi
-      JOIN products p ON oi.product_id = p.id
       JOIN orders o ON oi.order_id = o.id
       WHERE o.payment_status = 'paid'
     `;
@@ -480,11 +438,7 @@ class Order {
       params.push(endDate);
     }
 
-    query += `
-      GROUP BY p.id, p.name, p.sku, p.category
-      ORDER BY revenue DESC
-      LIMIT ?
-    `;
+    query += ' GROUP BY oi.product_id, oi.product_name ORDER BY revenue DESC LIMIT ?';
     params.push(limit);
 
     const [rows] = await pool.query(query, params);
@@ -517,11 +471,7 @@ class Order {
       params.push(endDate);
     }
 
-    query += `
-      GROUP BY customer_email, customer_name
-      ORDER BY total_spent DESC
-      LIMIT ?
-    `;
+    query += ' GROUP BY customer_email, customer_name ORDER BY total_spent DESC LIMIT ?';
     params.push(limit);
 
     const [rows] = await pool.query(query, params);
@@ -533,14 +483,7 @@ class Order {
     const offset = (page - 1) * limit;
 
     const [rows] = await pool.query(
-      `SELECT o.*, 
-        o.refund_amount,
-        o.refund_reason,
-        o.refunded_at
-       FROM orders o
-       WHERE o.payment_status = 'refunded'
-       ORDER BY o.refunded_at DESC
-       LIMIT ? OFFSET ?`,
+      `SELECT * FROM orders WHERE payment_status = 'refunded' ORDER BY refunded_at DESC LIMIT ? OFFSET ?`,
       [limit, offset]
     );
 
@@ -568,10 +511,10 @@ class Order {
         carrier,
         estimated_delivery,
         shipped_at,
-        (SELECT GROUP_CONCAT(status ORDER BY created_at DESC) FROM order_tracking WHERE order_id = ?) as tracking_history
+        order_status
        FROM orders 
        WHERE id = ? AND tracking_number IS NOT NULL`,
-      [orderId, orderId]
+      [orderId]
     );
     return rows[0];
   }
@@ -579,6 +522,7 @@ class Order {
   // Helper method to parse JSON
   static parseJson(str) {
     if (!str) return null;
+    if (typeof str === 'object') return str;
     try {
       return JSON.parse(str);
     } catch (e) {
