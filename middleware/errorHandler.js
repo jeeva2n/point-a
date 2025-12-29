@@ -12,47 +12,15 @@ const errorHandler = (err, req, res, next) => {
   if (err.message === 'Only image files are allowed') {
     return res.status(400).json({
       success: false,
-      message: err.message
-    });
-  }
-
-  // MongoDB errors
-  if (err.name === 'ValidationError') {
-    const messages = Object.values(err.errors).map(e => e.message);
-    return res.status(400).json({
-      success: false,
-      message: 'Validation error',
-      errors: messages
-    });
-  }
-
-  if (err.name === 'CastError' && err.kind === 'ObjectId') {
-    return res.status(400).json({
-      success: false,
-      message: 'Invalid ID format'
-    });
-  }
-
-  // JWT errors
-  if (err.name === 'JsonWebTokenError') {
-    return res.status(401).json({
-      success: false,
-      message: 'Invalid token'
-    });
-  }
-
-  if (err.name === 'TokenExpiredError') {
-    return res.status(401).json({
-      success: false,
-      message: 'Token expired'
+      message: 'Only image files are allowed (jpeg, jpg, png, gif, webp)'
     });
   }
 
   // Default error
   res.status(500).json({
     success: false,
-    message: 'Internal server error',
-    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    message: 'Something went wrong!',
+    error: process.env.NODE_ENV === 'development' ? err.message : {}
   });
 };
 

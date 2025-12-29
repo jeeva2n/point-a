@@ -1,100 +1,103 @@
 const Admin = require('../models/Admin');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
 
-// Admin login
-const login = async (req, res) => {
+exports.login = async (req, res) => {
   try {
-    const { password, username } = req.body;
+    const { username, password } = req.body;
     
-    // Find admin
-    let admin = await Admin.findOne({ username: username || 'admin' });
+    const admin = await Admin.findByUsername(username);
     
-    // Create default admin if not exists
     if (!admin) {
-      const hashedPassword = await bcrypt.hash('admin123', 10);
-      admin = new Admin({ 
-        username: 'admin',
-        password: hashedPassword,
-        email: 'admin@daksndt.com'
-      });
-      await admin.save();
-    }
-
-    // Verify password
-    const validPassword = await bcrypt.compare(password, admin.password);
-    if (!validPassword) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         success: false,
-        message: 'Invalid credentials' 
+        message: 'Invalid credentials'
       });
     }
-
-    // Generate token
-    const token = jwt.sign(
-      { 
-        id: admin._id,
-        username: admin.username 
-      }, 
-      process.env.JWT_SECRET || 'your-secret-key',
-      { expiresIn: '24h' }
-    );
-
-    res.json({ 
+    
+    const isPasswordValid = await Admin.comparePassword(password, admin.password);
+    
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+    
+    const token = await Admin.generateToken(admin);
+    
+    res.json({
       success: true,
+      message: 'Login successful',
       token,
       admin: {
-        id: admin._id,
+        id: admin.id,
         username: admin.username,
-        email: admin.email
+        email: admin.email,
+        role: admin.role
       }
     });
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       success: false,
-      message: 'Server error during login' 
+      message: 'Server error during login'
     });
   }
 };
 
-// Change password
-const changePassword = async (req, res) => {
+exports.getProfile = async (req, res) => {
   try {
-    const { currentPassword, newPassword } = req.body;
-    
-    const admin = await Admin.findById(req.adminId);
-    if (!admin) {
-      return res.status(404).json({ 
-        success: false,
-        message: 'Admin not found' 
-      });
-    }
-
-    const validPassword = await bcrypt.compare(currentPassword, admin.password);
-    if (!validPassword) {
-      return res.status(401).json({ 
-        success: false,
-        message: 'Current password is incorrect' 
-      });
-    }
-
-    admin.password = await bcrypt.hash(newPassword, 10);
-    await admin.save();
-
-    res.json({ 
+    res.json({
       success: true,
-      message: 'Password changed successfully' 
+      admin: req.admin
     });
   } catch (error) {
-    res.status(500).json({ 
+    res.status(500).json({
       success: false,
-      message: 'Error changing password' 
+      message: 'Server error'
     });
   }
 };
 
-module.exports = {
-  login,
-  changePassword
+exports.logout = async (req, res) => {
+  try {
+    // In a stateless JWT system, logout is client-side
+    res.json({
+      success: true,
+      message: 'Logged out successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
+  }
+};
+
+exports.createAdmin = async (req, res) => {
+  try {
+    const { username, password, email, role } = req.body;
+    
+    // Check if admin exists
+    const existingAdmin = await Admin.findByUsername(username);
+    if (existingAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Admin already exists'
+      });
+    }
+    
+    const newAdmin = await Admin.create({ username, password, email, role });
+    
+    res.status(201).json({
+      success: true,
+      message: 'Admin created successfully',
+      admin: newAdmin
+    });
+  } catch (error) {
+    console.error('Create admin error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error creating admin'
+    });
+  }
 };
