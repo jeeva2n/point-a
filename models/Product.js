@@ -1,572 +1,417 @@
-const pool = require('../config/database');
-const crypto = require('crypto');
+const db = require('../config/database');
 
-class Product {
-  static async create(productData) {
+// Helper function to parse JSON fields
+function parseProductFields(product) {
+  if (product.materials) {
+    try {
+      product.materials = JSON.parse(product.materials);
+    } catch (e) {
+      product.materials = [];
+    }
+  } else {
+    product.materials = [];
+  }
+
+  if (product.specifications) {
+    try {
+      product.specifications = JSON.parse(product.specifications);
+    } catch (e) {
+      product.specifications = {};
+    }
+  } else {
+    product.specifications = {};
+  }
+
+  if (product.features) {
+    try {
+      product.features = JSON.parse(product.features);
+    } catch (e) {
+      product.features = {};
+    }
+  } else {
+    product.features = {};
+  }
+
+  return product;
+}
+
+// Get all products with optional filters
+const getAllProducts = async (filters = {}) => {
+  try {
+    const { type, category, search, limit = 100 } = filters;
+    let query = 'SELECT * FROM products WHERE is_active = TRUE';
+    const params = [];
+
+    if (type && type !== 'all') {
+      query += ' AND type = ?';
+      params.push(type);
+    }
+
+    if (category) {
+      query += ' AND category = ?';
+      params.push(category);
+    }
+
+    if (search) {
+      query += ' AND (name LIKE ? OR description LIKE ? OR category LIKE ?)';
+      const searchTerm = `%${search}%`;
+      params.push(searchTerm, searchTerm, searchTerm);
+    }
+
+    query += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(parseInt(limit));
+
+    const [products] = await db.query(query, params);
+
+    // Get images for each product
+    const productsWithImages = await Promise.all(
+      products.map(async (product) => {
+        const [images] = await db.query(
+          'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
+          [product.id]
+        );
+
+        const parsedProduct = parseProductFields(product);
+        
+        parsedProduct.images = images.map(img => ({
+          id: img.id,
+          url: img.image_url,
+          isMain: img.is_main === 1,
+          sortOrder: img.sort_order
+        }));
+
+        const mainImage = images.find(img => img.is_main === 1);
+        parsedProduct.mainImage = mainImage ? mainImage.image_url : 
+          (images.length > 0 ? images[0].image_url : product.image_url);
+        
+        parsedProduct.image_url = parsedProduct.mainImage;
+
+        return parsedProduct;
+      })
+    );
+
+    return productsWithImages;
+  } catch (error) {
+    throw new Error(`Database error: ${error.message}`);
+  }
+};
+
+// Get single product by ID
+const getProductById = async (id) => {
+  try {
+    const [products] = await db.query(
+      'SELECT * FROM products WHERE id = ? AND is_active = TRUE',
+      [id]
+    );
+
+    if (products.length === 0) {
+      return null;
+    }
+
+    const product = products[0];
+
+    const [images] = await db.query(
+      'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
+      [id]
+    );
+
+    const parsedProduct = parseProductFields(product);
+    
+    parsedProduct.images = images.map(img => ({
+      id: img.id,
+      url: img.image_url,
+      isMain: img.is_main === 1,
+      sortOrder: img.sort_order
+    }));
+
+    const mainImage = images.find(img => img.is_main === 1);
+    parsedProduct.mainImage = mainImage ? mainImage.image_url : 
+      (images.length > 0 ? images[0].image_url : product.image_url);
+    
+    parsedProduct.image_url = parsedProduct.mainImage;
+
+    return parsedProduct;
+  } catch (error) {
+    throw new Error(`Database error: ${error.message}`);
+  }
+};
+
+// Create new product
+const createProduct = async (productData, files = []) => {
+  const connection = await db.getConnection();
+  
+  try {
+    await connection.beginTransaction();
+
     const {
-      name,
-      description,
-      short_description,
-      category,
-      subcategory,
-      materials,
-      dimensions,
-      tolerance,
-      flaws,
-      weight,
-      standards,
-      specifications,
-      features,
-      image_url,
-      type,
-      price,
-      compare_price,
-      cost_price,
-      stock_quantity,
-      sku,
-      meta_title,
-      meta_description,
-      meta_keywords
+      name, description, short_description, category, subcategory, type,
+      price, compare_price, cost_price, stock_quantity, sku,
+      dimensions, tolerance, flaws, weight, standards,
+      materials, specifications, features,
+      meta_title, meta_description, meta_keywords,
+      is_featured, mainImageIndex = 0
     } = productData;
 
-    // Generate SKU if not provided
-    const finalSku = sku || `PROD-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-    
-    // Generate slug from name
-    const slug = name.toLowerCase()
-      .replace(/[^\w\s-]/g, '')
-      .replace(/\s+/g, '-')
-      .replace(/--+/g, '-');
-
-    // Handle materials array
-    let materialsJson = '[]';
+    let materialsArray = [];
     if (materials) {
-      if (Array.isArray(materials)) {
-        materialsJson = JSON.stringify(materials);
-      } else if (typeof materials === 'string') {
-        try {
-          JSON.parse(materials);
-          materialsJson = materials;
-        } catch (e) {
-          materialsJson = JSON.stringify([materials]);
-        }
+      try {
+        materialsArray = typeof materials === 'string' ? JSON.parse(materials) : materials;
+      } catch (e) {
+        materialsArray = Array.isArray(materials) ? materials : [];
       }
     }
 
-    const [result] = await pool.query(
-      `INSERT INTO products 
-       (name, slug, sku, description, short_description, category, subcategory, 
-        materials, dimensions, tolerance, flaws, weight, standards, specifications, features, 
-        image_url, type, price, compare_price, cost_price, stock_quantity,
-        meta_title, meta_description, meta_keywords) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    let specificationsObj = {};
+    if (specifications) {
+      try {
+        specificationsObj = typeof specifications === 'string' ? JSON.parse(specifications) : specifications;
+      } catch (e) {
+        specificationsObj = {};
+      }
+    }
+
+    let featuresObj = {};
+    if (features) {
+      try {
+        featuresObj = typeof features === 'string' ? JSON.parse(features) : features;
+      } catch (e) {
+        featuresObj = {};
+      }
+    }
+
+    const [result] = await connection.query(
+      `INSERT INTO products (
+        name, description, short_description, category, subcategory, type,
+        price, compare_price, cost_price, stock_quantity, sku,
+        dimensions, tolerance, flaws, weight, standards,
+        materials, specifications, features,
+        meta_title, meta_description, meta_keywords, is_featured
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        name,
-        slug,
-        finalSku,
-        description || null,
-        short_description || (description ? description.substring(0, 500) : null),
-        category,
-        subcategory || null,
-        materialsJson,
-        dimensions || null,
-        tolerance || null,
-        flaws || null,
-        weight || null,
-        standards || null,
-        typeof specifications === 'object' ? JSON.stringify(specifications) : (specifications || null),
-        typeof features === 'object' ? JSON.stringify(features) : (features || null),
-        image_url || null,
-        type,
-        price || 0,
-        compare_price || null,
-        cost_price || null,
-        stock_quantity || 0,
-        meta_title || null,
-        meta_description || null,
-        meta_keywords || null
+        name, description || '', short_description || '', category, subcategory || '', type,
+        parseFloat(price) || 0, compare_price ? parseFloat(compare_price) : null, 
+        cost_price ? parseFloat(cost_price) : null, parseInt(stock_quantity) || 10, sku || '',
+        dimensions || null, tolerance || null, flaws || null, weight || null, standards || null,
+        JSON.stringify(materialsArray), JSON.stringify(specificationsObj), JSON.stringify(featuresObj),
+        meta_title || null, meta_description || null, meta_keywords || null,
+        is_featured === 'true' || is_featured === true
       ]
     );
-    
-    return this.findById(result.insertId);
-  }
 
-  static async findById(id) {
-    const [rows] = await pool.query(
-      'SELECT * FROM products WHERE id = ? AND is_active = 1',
-      [id]
-    );
-    
-    if (!rows[0]) return null;
+    const productId = result.insertId;
 
-    // Get images
-    const [images] = await pool.query(
-      'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
-      [id]
-    );
-    
-    const product = this.parseJsonFields(rows[0]);
-    product.images = images.map(img => ({
-      id: img.id,
-      url: img.image_url,
-      isMain: img.is_main === 1,
-      sortOrder: img.sort_order
-    }));
-    product.mainImage = images.find(img => img.is_main === 1)?.image_url || product.image_url;
-    
+    let mainImageUrl = null;
+    if (files && files.length > 0) {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const imageUrl = `/uploads/products/${file.filename}`;
+        const isMain = parseInt(mainImageIndex) === i;
+        
+        if (isMain) {
+          mainImageUrl = imageUrl;
+        }
+
+        await connection.query(
+          'INSERT INTO product_images (product_id, image_url, is_main, sort_order) VALUES (?, ?, ?, ?)',
+          [productId, imageUrl, isMain, i]
+        );
+      }
+
+      if (mainImageUrl) {
+        await connection.query('UPDATE products SET image_url = ? WHERE id = ?', [mainImageUrl, productId]);
+      }
+    }
+
+    await connection.commit();
+
+    const product = await getProductById(productId);
     return product;
+    
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
   }
+};
 
-  static async findBySlug(slug) {
-    const [rows] = await pool.query(
-      'SELECT * FROM products WHERE slug = ? AND is_active = 1',
-      [slug]
-    );
-    
-    if (!rows[0]) return null;
+// Update product
+const updateProduct = async (id, productData, files = [], deleteImages = []) => {
+  const connection = await db.getConnection();
+  
+  try {
+    await connection.beginTransaction();
 
-    const [images] = await pool.query(
-      'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
-      [rows[0].id]
-    );
-    
-    const product = this.parseJsonFields(rows[0]);
-    product.images = images.map(img => ({
-      id: img.id,
-      url: img.image_url,
-      isMain: img.is_main === 1,
-      sortOrder: img.sort_order
-    }));
-    product.mainImage = images.find(img => img.is_main === 1)?.image_url || product.image_url;
-    
-    return product;
-  }
+    if (deleteImages && deleteImages.length > 0) {
+      for (const imageId of deleteImages) {
+        await connection.query('DELETE FROM product_images WHERE id = ? AND product_id = ?', [imageId, id]);
+      }
+    }
 
-  static async findAll(filters = {}, page = 1, limit = 20, sortField = 'created_at DESC') {
-    let query = 'SELECT * FROM products WHERE is_active = 1';
+    if (files && files.length > 0) {
+      const [maxOrder] = await connection.query(
+        'SELECT MAX(sort_order) as max_order FROM product_images WHERE product_id = ?',
+        [id]
+      );
+      let sortOrder = (maxOrder[0].max_order || -1) + 1;
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        await connection.query(
+          'INSERT INTO product_images (product_id, image_url, is_main, sort_order) VALUES (?, ?, ?, ?)',
+          [id, `/uploads/products/${file.filename}`, 0, sortOrder + i]
+        );
+      }
+    }
+
+    const { mainImageId, mainImageIndex, materials, specifications, features, ...otherData } = productData;
+    
+    if (mainImageId !== undefined && mainImageId !== null) {
+      await connection.query('UPDATE product_images SET is_main = 0 WHERE product_id = ?', [id]);
+      await connection.query('UPDATE product_images SET is_main = 1 WHERE id = ? AND product_id = ?', [mainImageId, id]);
+      
+      const [mainImageRow] = await connection.query('SELECT image_url FROM product_images WHERE id = ?', [mainImageId]);
+      if (mainImageRow.length > 0) {
+        await connection.query('UPDATE products SET image_url = ? WHERE id = ?', [mainImageRow[0].image_url, id]);
+      }
+    }
+
+    let materialsArray = [];
+    if (materials !== undefined) {
+      try {
+        materialsArray = typeof materials === 'string' ? JSON.parse(materials) : materials;
+      } catch (e) {
+        materialsArray = Array.isArray(materials) ? materials : [];
+      }
+    }
+
+    let specificationsObj = {};
+    if (specifications !== undefined) {
+      try {
+        specificationsObj = typeof specifications === 'string' ? JSON.parse(specifications) : specifications;
+      } catch (e) {
+        specificationsObj = {};
+      }
+    }
+
+    let featuresObj = {};
+    if (features !== undefined) {
+      try {
+        featuresObj = typeof features === 'string' ? JSON.parse(features) : features;
+      } catch (e) {
+        featuresObj = {};
+      }
+    }
+
+    const updates = [];
     const params = [];
-    
-    if (filters.type) {
-      query += ' AND type = ?';
-      params.push(filters.type);
-    }
-    
-    if (filters.category) {
-      query += ' AND category = ?';
-      params.push(filters.category);
-    }
-    
-    if (filters.subcategory) {
-      query += ' AND subcategory = ?';
-      params.push(filters.subcategory);
-    }
-    
-    if (filters.min_price) {
-      query += ' AND price >= ?';
-      params.push(filters.min_price);
-    }
-    
-    if (filters.max_price) {
-      query += ' AND price <= ?';
-      params.push(filters.max_price);
-    }
-    
-    if (filters.featured === 'true') {
-      query += ' AND is_featured = 1';
-    }
-    
-    // Get total count
-    const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
-    const [countResult] = await pool.query(countQuery, params);
-    const total = countResult[0]?.total || 0;
-    
-    // Add ordering and pagination
-    const offset = (page - 1) * limit;
-    query += ` ORDER BY ${sortField} LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
-    
-    const [rows] = await pool.query(query, params);
-    
-    // Get images for each product
-    const products = await Promise.all(rows.map(async row => {
-      const [images] = await pool.query(
-        'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
-        [row.id]
-      );
-      
-      const product = this.parseJsonFields(row);
-      product.images = images.map(img => ({
-        id: img.id,
-        url: img.image_url,
-        isMain: img.is_main === 1,
-        sortOrder: img.sort_order
-      }));
-      product.mainImage = images.find(img => img.is_main === 1)?.image_url || product.image_url;
-      
-      return product;
-    }));
-    
-    return {
-      products,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    };
-  }
 
-  static async search(searchTerm, page = 1, limit = 20) {
-    if (!searchTerm || searchTerm.trim() === '') {
-      return { products: [], pagination: { page, limit, total: 0, pages: 0 } };
-    }
-    
-    const offset = (page - 1) * limit;
-    const likeTerm = `%${searchTerm}%`;
-    
-    const [rows] = await pool.query(
-      `SELECT * FROM products 
-       WHERE is_active = 1 
-       AND (name LIKE ? OR description LIKE ? OR materials LIKE ? OR standards LIKE ? OR category LIKE ?)
-       ORDER BY 
-         CASE WHEN name LIKE ? THEN 1 ELSE 2 END,
-         created_at DESC
-       LIMIT ? OFFSET ?`,
-      [likeTerm, likeTerm, likeTerm, likeTerm, likeTerm, likeTerm, limit, offset]
-    );
-    
-    const [countResult] = await pool.query(
-      `SELECT COUNT(*) as total FROM products 
-       WHERE is_active = 1 
-       AND (name LIKE ? OR description LIKE ? OR materials LIKE ? OR standards LIKE ? OR category LIKE ?)`,
-      [likeTerm, likeTerm, likeTerm, likeTerm, likeTerm]
-    );
-    
-    const total = countResult[0]?.total || 0;
-    
-    // Get images for each product
-    const products = await Promise.all(rows.map(async row => {
-      const [images] = await pool.query(
-        'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
-        [row.id]
-      );
-      
-      const product = this.parseJsonFields(row);
-      product.images = images.map(img => ({
-        id: img.id,
-        url: img.image_url,
-        isMain: img.is_main === 1,
-        sortOrder: img.sort_order
-      }));
-      product.mainImage = images.find(img => img.is_main === 1)?.image_url || product.image_url;
-      
-      return product;
-    }));
-    
-    return {
-      products,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    };
-  }
-
-  static async update(id, productData, adminId = null) {
-    const oldProduct = await this.findById(id);
-    if (!oldProduct) return null;
-
-    const updateFields = [];
-    const updateValues = [];
-    
-    const fieldMapping = {
-      name: 'name',
-      description: 'description',
-      short_description: 'short_description',
-      category: 'category',
-      subcategory: 'subcategory',
-      materials: 'materials',
-      dimensions: 'dimensions',
-      tolerance: 'tolerance',
-      flaws: 'flaws',
-      weight: 'weight',
-      standards: 'standards',
-      specifications: 'specifications',
-      features: 'features',
-      image_url: 'image_url',
-      type: 'type',
-      price: 'price',
-      compare_price: 'compare_price',
-      cost_price: 'cost_price',
-      stock_quantity: 'stock_quantity',
-      is_featured: 'is_featured',
-      is_active: 'is_active',
-      meta_title: 'meta_title',
-      meta_description: 'meta_description',
-      meta_keywords: 'meta_keywords'
+    const fields = {
+      name: otherData.name,
+      description: otherData.description,
+      short_description: otherData.short_description,
+      category: otherData.category,
+      subcategory: otherData.subcategory,
+      type: otherData.type,
+      price: otherData.price,
+      compare_price: otherData.compare_price,
+      cost_price: otherData.cost_price,
+      stock_quantity: otherData.stock_quantity,
+      sku: otherData.sku,
+      dimensions: otherData.dimensions,
+      tolerance: otherData.tolerance,
+      flaws: otherData.flaws,
+      weight: otherData.weight,
+      standards: otherData.standards,
+      meta_title: otherData.meta_title,
+      meta_description: otherData.meta_description,
+      meta_keywords: otherData.meta_keywords,
+      is_featured: otherData.is_featured
     };
 
-    for (const [key, dbField] of Object.entries(fieldMapping)) {
-      if (key in productData) {
-        let value = productData[key];
-        
-        // Handle JSON fields
-        if (['specifications', 'features', 'materials'].includes(key)) {
-          if (typeof value === 'object') {
-            value = JSON.stringify(value);
-          } else if (typeof value === 'string' && key === 'materials') {
-            try {
-              JSON.parse(value);
-            } catch (e) {
-              value = JSON.stringify([value]);
-            }
-          }
-        }
-        
-        updateFields.push(`${dbField} = ?`);
-        updateValues.push(value);
-      }
-    }
-
-    if (updateFields.length === 0) {
-      return oldProduct;
-    }
-
-    updateValues.push(id);
-    
-    const [result] = await pool.query(
-      `UPDATE products SET 
-       ${updateFields.join(', ')},
-       updated_at = CURRENT_TIMESTAMP 
-       WHERE id = ?`,
-      updateValues
-    );
-
-    if (result.affectedRows > 0) {
-      return this.findById(id);
-    }
-    
-    return null;
-  }
-
-  static async delete(id, adminId = null) {
-    const product = await this.findById(id);
-    if (!product) return false;
-
-    const [result] = await pool.query(
-      'UPDATE products SET is_active = 0 WHERE id = ?',
-      [id]
-    );
-
-    return result.affectedRows > 0;
-  }
-
-  static async addImages(productId, images) {
-    const [maxOrder] = await pool.query(
-      'SELECT MAX(sort_order) as max_order FROM product_images WHERE product_id = ?',
-      [productId]
-    );
-    let sortOrder = (maxOrder[0].max_order || -1) + 1;
-
-    const [existingImages] = await pool.query(
-      'SELECT COUNT(*) as count FROM product_images WHERE product_id = ?',
-      [productId]
-    );
-    const isFirstImage = existingImages[0].count === 0;
-
-    const insertedImages = [];
-    for (let i = 0; i < images.length; i++) {
-      const isMain = isFirstImage && i === 0 ? 1 : 0;
-      
-      const [result] = await pool.query(
-        `INSERT INTO product_images (product_id, image_url, is_main, sort_order)
-         VALUES (?, ?, ?, ?)`,
-        [productId, images[i], isMain, sortOrder + i]
-      );
-
-      insertedImages.push({
-        id: result.insertId,
-        url: images[i],
-        isMain: isMain === 1,
-        sortOrder: sortOrder + i
-      });
-
-      if (isMain) {
-        await pool.query('UPDATE products SET image_url = ? WHERE id = ?', [images[i], productId]);
-      }
-    }
-
-    return insertedImages;
-  }
-
-  static async deleteImage(productId, imageId) {
-    const [images] = await pool.query(
-      'SELECT * FROM product_images WHERE id = ? AND product_id = ?',
-      [imageId, productId]
-    );
-
-    if (images.length === 0) return null;
-
-    const image = images[0];
-    await pool.query('DELETE FROM product_images WHERE id = ?', [imageId]);
-
-    if (image.is_main === 1) {
-      const [remainingImages] = await pool.query(
-        'SELECT id, image_url FROM product_images WHERE product_id = ? ORDER BY sort_order ASC LIMIT 1',
-        [productId]
-      );
-
-      if (remainingImages.length > 0) {
-        await pool.query('UPDATE product_images SET is_main = 1 WHERE id = ?', [remainingImages[0].id]);
-        await pool.query('UPDATE products SET image_url = ? WHERE id = ?', [remainingImages[0].image_url, productId]);
-      } else {
-        await pool.query('UPDATE products SET image_url = NULL WHERE id = ?', [productId]);
-      }
-    }
-
-    return image.image_url;
-  }
-
-  static async setMainImage(productId, imageId) {
-    const [images] = await pool.query(
-      'SELECT image_url FROM product_images WHERE id = ? AND product_id = ?',
-      [imageId, productId]
-    );
-
-    if (images.length === 0) return false;
-
-    await pool.query('UPDATE product_images SET is_main = 0 WHERE product_id = ?', [productId]);
-    await pool.query('UPDATE product_images SET is_main = 1 WHERE id = ?', [imageId]);
-    await pool.query('UPDATE products SET image_url = ? WHERE id = ?', [images[0].image_url, productId]);
-
-    return true;
-  }
-
-  static async reorderImages(productId, imageOrder) {
-    for (let i = 0; i < imageOrder.length; i++) {
-      await pool.query(
-        'UPDATE product_images SET sort_order = ? WHERE id = ? AND product_id = ?',
-        [i, imageOrder[i], productId]
-      );
-    }
-    return true;
-  }
-
-  static async getCategories() {
-    const [rows] = await pool.query(
-      `SELECT 
-        category, 
-        type, 
-        COUNT(*) as product_count,
-        MIN(price) as min_price,
-        MAX(price) as max_price
-       FROM products 
-       WHERE is_active = 1 
-       GROUP BY category, type 
-       ORDER BY category, type`
-    );
-    return rows;
-  }
-
-  static async getCountByCategory(categoryName) {
-    const [rows] = await pool.query(
-      'SELECT COUNT(*) as count FROM products WHERE category = ? AND is_active = 1',
-      [categoryName]
-    );
-    return rows[0]?.count || 0;
-  }
-
-  static async getRelatedProducts(productId, limit = 4) {
-    const product = await this.findById(productId);
-    if (!product) return [];
-
-    const [rows] = await pool.query(
-      `SELECT * FROM products
-       WHERE is_active = 1 
-       AND id != ?
-       AND (category = ? OR type = ?)
-       ORDER BY 
-         CASE WHEN category = ? THEN 1 ELSE 2 END,
-         CASE WHEN type = ? THEN 1 ELSE 2 END,
-         created_at DESC
-       LIMIT ?`,
-      [productId, product.category, product.type, product.category, product.type, limit]
-    );
-    
-    return Promise.all(rows.map(async row => {
-      const [images] = await pool.query(
-        'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC LIMIT 1',
-        [row.id]
-      );
-      
-      const parsed = this.parseJsonFields(row);
-      parsed.mainImage = images[0]?.image_url || row.image_url;
-      return parsed;
-    }));
-  }
-
-  static async updateStock(id, quantity) {
-    const [result] = await pool.query(
-      'UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ? AND stock_quantity >= ?',
-      [quantity, id, quantity]
-    );
-    
-    return result.affectedRows > 0;
-  }
-
-  // Helper method to parse JSON fields
-  static parseJsonFields(row) {
-    const jsonFields = ['specifications', 'features', 'materials'];
-    
-    jsonFields.forEach(field => {
-      if (row[field] && typeof row[field] === 'string') {
-        try {
-          row[field] = JSON.parse(row[field]);
-        } catch (e) {
-          if (field === 'materials') {
-            row[field] = [];
-          } else {
-            row[field] = {};
-          }
-        }
-      } else if (!row[field]) {
-        if (field === 'materials') {
-          row[field] = [];
+    Object.entries(fields).forEach(([key, value]) => {
+      if (value !== undefined) {
+        if (key === 'price' || key === 'compare_price' || key === 'cost_price') {
+          updates.push(`${key} = ?`);
+          params.push(value !== '' ? parseFloat(value) : null);
+        } else if (key === 'stock_quantity') {
+          updates.push(`${key} = ?`);
+          params.push(value !== '' ? parseInt(value) : 0);
+        } else if (key === 'is_featured') {
+          updates.push(`${key} = ?`);
+          params.push(value === 'true' || value === true);
         } else {
-          row[field] = {};
+          updates.push(`${key} = ?`);
+          params.push(value || null);
         }
       }
     });
-    
-    // Parse numbers
-    if (row.price) row.price = parseFloat(row.price);
-    if (row.compare_price) row.compare_price = parseFloat(row.compare_price);
-    if (row.cost_price) row.cost_price = parseFloat(row.cost_price);
-    if (row.stock_quantity) row.stock_quantity = parseInt(row.stock_quantity);
-    if (row.view_count) row.view_count = parseInt(row.view_count);
-    if (row.average_rating) row.average_rating = parseFloat(row.average_rating);
-    if (row.review_count) row.review_count = parseInt(row.review_count);
-    
-    return row;
-  }
 
-  static async getStats() {
-    const [results] = await pool.query(`
-      SELECT 
-        COUNT(*) as total_products,
-        SUM(CASE WHEN is_featured = 1 THEN 1 ELSE 0 END) as featured_products,
-        SUM(CASE WHEN stock_quantity <= 5 THEN 1 ELSE 0 END) as low_stock_products,
-        SUM(CASE WHEN stock_quantity = 0 THEN 1 ELSE 0 END) as out_of_stock_products,
-        AVG(price) as average_price
-      FROM products 
-      WHERE is_active = 1
-    `);
+    if (materials !== undefined) {
+      updates.push('materials = ?');
+      params.push(JSON.stringify(materialsArray));
+    }
     
-    return results[0];
-  }
-}
+    if (specifications !== undefined) {
+      updates.push('specifications = ?');
+      params.push(JSON.stringify(specificationsObj));
+    }
+    
+    if (features !== undefined) {
+      updates.push('features = ?');
+      params.push(JSON.stringify(featuresObj));
+    }
 
-module.exports = Product;
+    if (updates.length > 0) {
+      params.push(id);
+      await connection.query(
+        `UPDATE products SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        params
+      );
+    }
+
+    await connection.commit();
+
+    const product = await getProductById(id);
+    return product;
+    
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+// Delete product
+const deleteProduct = async (id) => {
+  const connection = await db.getConnection();
+  
+  try {
+    await connection.beginTransaction();
+
+    const [images] = await connection.query(
+      'SELECT image_url FROM product_images WHERE product_id = ?',
+      [id]
+    );
+
+    await connection.query('DELETE FROM products WHERE id = ?', [id]);
+
+    await connection.commit();
+
+    return images;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+module.exports = {
+  getAllProducts,
+  getProductById,
+  createProduct,
+  updateProduct,
+  deleteProduct
+};

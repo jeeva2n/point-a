@@ -1,6 +1,11 @@
 const jwt = require('jsonwebtoken');
-const pool = require('../config/database');
+const db = require('../config/database');
 
+const JWT_SECRET = process.env.JWT_SECRET || 'daks-ndt-super-secret-jwt-key-2024';
+
+/* =========================
+   Admin Authentication Middleware
+========================= */
 const auth = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -14,33 +19,9 @@ const auth = async (req, res, next) => {
 
     const token = authHeader.split(' ')[1];
 
+    let decoded;
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
-
-      // Check if admin exists and is active
-      const [admins] = await pool.query(
-        'SELECT id, username, email, role, is_active FROM admins WHERE id = ?',
-        [decoded.id]
-      );
-
-      if (admins.length === 0) {
-        return res.status(401).json({
-          success: false,
-          message: 'Invalid token. Admin not found.'
-        });
-      }
-
-      const admin = admins[0];
-
-      if (!admin.is_active) {
-        return res.status(403).json({
-          success: false,
-          message: 'Account is disabled.'
-        });
-      }
-
-      req.admin = admin;
-      next();
+      decoded = jwt.verify(token, JWT_SECRET);
     } catch (jwtError) {
       if (jwtError.name === 'TokenExpiredError') {
         return res.status(401).json({
@@ -50,15 +31,44 @@ const auth = async (req, res, next) => {
       }
       throw jwtError;
     }
+
+    // Check if admin exists
+    const [admins] = await db.query(
+      'SELECT id, username, email, role, is_active FROM admins WHERE id = ?',
+      [decoded.id || decoded.adminId || decoded.userId]
+    );
+
+    if (admins.length === 0) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid token. Admin not found.'
+      });
+    }
+
+    const admin = admins[0];
+
+    if (admin.is_active === 0) {
+      return res.status(403).json({
+        success: false,
+        message: 'Account is disabled.'
+      });
+    }
+
+    req.admin = admin;
+    next();
+
   } catch (error) {
     console.error('Auth middleware error:', error);
-    res.status(401).json({
+    return res.status(401).json({
       success: false,
       message: 'Invalid token.'
     });
   }
 };
 
+/* =========================
+   Permission Middleware
+========================= */
 const hasPermission = (permission) => {
   return (req, res, next) => {
     if (!req.admin) {
@@ -68,7 +78,6 @@ const hasPermission = (permission) => {
       });
     }
 
-    // Define role permissions
     const rolePermissions = {
       super_admin: ['*'],
       admin: [
@@ -79,7 +88,8 @@ const hasPermission = (permission) => {
         'manage_orders',
         'view_reports',
         'manage_refunds',
-        'view_refunds'
+        'view_refunds',
+        'view_products'
       ],
       editor: [
         'manage_products',
@@ -95,13 +105,13 @@ const hasPermission = (permission) => {
     const userPermissions = rolePermissions[req.admin.role] || [];
 
     if (userPermissions.includes('*') || userPermissions.includes(permission)) {
-      next();
-    } else {
-      res.status(403).json({
-        success: false,
-        message: 'Permission denied.'
-      });
+      return next();
     }
+
+    return res.status(403).json({
+      success: false,
+      message: 'Permission denied.'
+    });
   };
 };
 

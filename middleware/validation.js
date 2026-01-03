@@ -1,11 +1,100 @@
 const { body, validationResult } = require('express-validator');
-const { hasPermission } = require('./auth');
 
+/* =========================
+   Simple Validation Helpers
+========================= */
+function isValidEmail(email) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+}
+
+/* =========================
+   Basic Validation Middlewares
+========================= */
+const validateOrderBasic = (req, res, next) => {
+  const { customerDetails } = req.body;
+
+  if (!customerDetails) {
+    return res.status(400).json({
+      success: false,
+      message: 'Customer details are required'
+    });
+  }
+
+  if (!customerDetails.name || customerDetails.name.trim() === '') {
+    return res.status(400).json({
+      success: false,
+      message: 'Customer name is required'
+    });
+  }
+
+  if (!customerDetails.email || !isValidEmail(customerDetails.email)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Valid email is required'
+    });
+  }
+
+  next();
+};
+
+const validateProductBasic = (req, res, next) => {
+  const { name, category, type } = req.body;
+
+  if (!name || name.trim() === '') {
+    return res.status(400).json({
+      success: false,
+      message: 'Product name is required'
+    });
+  }
+
+  if (!category || category.trim() === '') {
+    return res.status(400).json({
+      success: false,
+      message: 'Product category is required'
+    });
+  }
+
+  if (!type || type.trim() === '') {
+    return res.status(400).json({
+      success: false,
+      message: 'Product type is required'
+    });
+  }
+
+  next();
+};
+
+const validateEmail = (req, res, next) => {
+  const { email } = req.body;
+
+  if (!email || !isValidEmail(email)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Valid email is required'
+    });
+  }
+
+  next();
+};
+
+/* =========================
+   Express-Validator Based
+========================= */
 const validateProduct = [
   body('name').notEmpty().withMessage('Product name is required').trim(),
   body('description').optional().trim(),
   body('category').notEmpty().withMessage('Category is required').trim(),
-  body('type').isIn(['calibration_block', 'flawed_specimen', 'validation_block', 'ndt_kit', 'accessory', 'other']).withMessage('Invalid product type'),
+  body('type')
+    .isIn([
+      'calibration_block',
+      'flawed_specimen',
+      'validation_block',
+      'ndt_kit',
+      'accessory',
+      'other'
+    ])
+    .withMessage('Invalid product type'),
   body('price').optional().isFloat({ min: 0 }).withMessage('Price must be a positive number'),
   body('dimensions').optional().trim(),
   body('tolerance').optional().trim(),
@@ -126,6 +215,9 @@ const validateUserLogin = [
 ];
 
 module.exports = {
+  validateOrderBasic,
+  validateProductBasic,
+  validateEmail,
   validateProduct,
   validateCategory,
   validateOrder,
