@@ -12,6 +12,7 @@ const authRoutes = require('./routes/authRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const contactRoutes = require('./routes/contactRoutes');
 const adminRoutes = require('./routes/adminRoutes'); 
+const galleryRoutes = require('./routes/galleryRoutes');
 
 const app = express();
 
@@ -26,6 +27,7 @@ app.use(express.urlencoded({ extended: true }));
    Static Files
 ========================= */
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads/gallery', express.static(path.join(__dirname, 'uploads/gallery')));
 
 /* =========================
    Routes
@@ -36,9 +38,11 @@ app.use('/api/auth', authRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/contact', contactRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/gallery', galleryRoutes);
 
-
-// Database connection
+/* =========================
+   Database Connection
+========================= */
 const mysql = require('mysql2');
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
@@ -52,10 +56,27 @@ const pool = mysql.createPool({
 
 const db = pool.promise();
 
-// Initialize database tables
+/* =========================
+   Helper: Get Connection (for transactions)
+========================= */
+const getConnection = () => {
+  return new Promise((resolve, reject) => {
+    pool.getConnection((err, connection) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(connection);
+      }
+    });
+  });
+};
+
+/* =========================
+   Initialize Database Tables
+========================= */
 async function initDb() {
   try {
-    // Create products table
+    // Create products table WITH sort_order column
     await db.query(`
       CREATE TABLE IF NOT EXISTS products (
         id INT PRIMARY KEY AUTO_INCREMENT,
@@ -84,10 +105,49 @@ async function initDb() {
         meta_keywords VARCHAR(255),
         is_featured BOOLEAN DEFAULT FALSE,
         is_active BOOLEAN DEFAULT TRUE,
+        sort_order INT DEFAULT 9999,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
+
+    // Add sort_order column if it doesn't exist (for existing tables)
+    try {
+      await db.query(`
+        ALTER TABLE products ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 9999
+      `);
+    } catch (alterError) {
+      // Column might already exist or MySQL version doesn't support IF NOT EXISTS
+      // Try alternative approach
+      try {
+        const [columns] = await db.query(`SHOW COLUMNS FROM products LIKE 'sort_order'`);
+        if (columns.length === 0) {
+          await db.query(`ALTER TABLE products ADD COLUMN sort_order INT DEFAULT 9999`);
+          console.log('✅ Added sort_order column to products table');
+        }
+      } catch (e) {
+        // Column already exists, ignore
+      }
+    }
+
+    // Create gallery table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS gallery (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        title VARCHAR(255),
+        description TEXT,
+        file_url VARCHAR(500) NOT NULL,
+        file_type ENUM('image', 'video') NOT NULL,
+        thumbnail_url VARCHAR(500),
+        category VARCHAR(100),
+        tags VARCHAR(255),
+        is_active BOOLEAN DEFAULT TRUE,
+        sort_order INT DEFAULT 9999,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ Gallery table initialized');
 
     // Create product_images table
     await db.query(`
@@ -285,9 +345,10 @@ async function initDb() {
   }
 }
 
-// Helper function to parse JSON fields
+/* =========================
+   Helper: Parse Product JSON Fields
+========================= */
 function parseProductFields(product) {
-  // Parse JSON fields
   if (product.materials) {
     try {
       product.materials = JSON.parse(product.materials);
@@ -321,11 +382,11 @@ function parseProductFields(product) {
   return product;
 }
 
-// ======================
-// PRODUCT ROUTES
-// ======================
+/* =========================
+   PRODUCT ROUTES
+========================= */
 
-// GET ALL PRODUCTS
+// GET ALL PRODUCTS (with sort_order)
 app.get('/api/products', async (req, res) => {
   try {
     const { type, category, search, limit = 100 } = req.query;
@@ -348,7 +409,8 @@ app.get('/api/products', async (req, res) => {
       params.push(searchTerm, searchTerm, searchTerm);
     }
 
-    query += ' ORDER BY created_at DESC LIMIT ?';
+    // ✅ Sort by sort_order first, then by created_at
+    query += ' ORDER BY sort_order ASC, created_at DESC LIMIT ?';
     params.push(parseInt(limit));
 
     const [products] = await db.query(query, params);
@@ -370,7 +432,6 @@ app.get('/api/products', async (req, res) => {
           sortOrder: img.sort_order
         }));
 
-        // Set main image
         const mainImage = images.find(img => img.is_main === 1);
         parsedProduct.mainImage = mainImage ? mainImage.image_url : 
           (images.length > 0 ? images[0].image_url : product.image_url);
@@ -387,6 +448,252 @@ app.get('/api/products', async (req, res) => {
     });
   } catch (error) {
     console.error('Get products error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error fetching products'
+    });
+  }
+});
+
+/* =========================
+   ⭐ REORDER PRODUCTS ENDPOINT
+========================= */
+app.put('/api/products/reorder', async (req, res) => {
+  console.log('📋 Received reorder request');
+  
+  try {
+    const { items } = req.body;
+    
+    console.log('📋 Reordering items:', items?.length);
+    
+    if (!items || !Array.isArray(items)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid request data. Expected items array.'
+      });
+    }
+
+    if (items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Items array is empty.'
+      });
+    }
+    
+    // Use transaction for atomic updates
+    const connection = await getConnection();
+    
+    try {
+      await new Promise((resolve, reject) => {
+        connection.beginTransaction((err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      
+      // Update each product's sort_order
+      for (const item of items) {
+        if (item.id && typeof item.sort_order === 'number') {
+          console.log(`   Updating product ${item.id} to sort_order ${item.sort_order}`);
+          
+          await new Promise((resolve, reject) => {
+            connection.query(
+              'UPDATE products SET sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+              [item.sort_order, item.id],
+              (err, result) => {
+                if (err) reject(err);
+                else resolve(result);
+              }
+            );
+          });
+        }
+      }
+      
+      await new Promise((resolve, reject) => {
+        connection.commit((err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      
+      connection.release();
+      
+      console.log(`✅ Reordered ${items.length} products successfully`);
+      
+      res.json({
+        success: true,
+        message: `Product order updated successfully (${items.length} items)`
+      });
+      
+    } catch (error) {
+      await new Promise((resolve) => {
+        connection.rollback(() => resolve());
+      });
+      connection.release();
+      
+      console.error('❌ Transaction error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to update product order'
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Error reordering products:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update product order',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/* =========================
+   ⭐ REORDER PRODUCTS BY TYPE ENDPOINT
+========================= */
+app.put('/api/products/reorder/:type', async (req, res) => {
+  console.log('📋 Received reorder request for type:', req.params.type);
+  
+  try {
+    const { type } = req.params;
+    const { items } = req.body;
+    
+    console.log(`📋 Reordering ${items?.length} items for type: ${type}`);
+    
+    if (!items || !Array.isArray(items)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid request data. Expected items array.'
+      });
+    }
+
+    if (items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Items array is empty.'
+      });
+    }
+    
+    // Use transaction for atomic updates
+    const connection = await getConnection();
+    
+    try {
+      await new Promise((resolve, reject) => {
+        connection.beginTransaction((err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      
+      // Update each product's sort_order
+      for (const item of items) {
+        if (item.id && typeof item.sort_order === 'number') {
+          await new Promise((resolve, reject) => {
+            connection.query(
+              'UPDATE products SET sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND type = ?',
+              [item.sort_order, item.id, type],
+              (err, result) => {
+                if (err) reject(err);
+                else resolve(result);
+              }
+            );
+          });
+        }
+      }
+      
+      await new Promise((resolve, reject) => {
+        connection.commit((err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      
+      connection.release();
+      
+      console.log(`✅ Reordered ${items.length} ${type} products successfully`);
+      
+      res.json({
+        success: true,
+        message: `Product order updated successfully for ${type} (${items.length} items)`
+      });
+      
+    } catch (error) {
+      await new Promise((resolve) => {
+        connection.rollback(() => resolve());
+      });
+      connection.release();
+      
+      console.error('❌ Transaction error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to update product order'
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Error reordering products:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update product order',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/* =========================
+   GET PRODUCTS BY TYPE
+========================= */
+app.get('/api/products/by-type/:type', async (req, res) => {
+  try {
+    const { type } = req.params;
+    const { limit = 500 } = req.query;
+    
+    console.log(`📦 Fetching products for type: ${type}`);
+    
+    const [products] = await db.query(
+      `SELECT * FROM products 
+       WHERE is_active = TRUE AND type = ? 
+       ORDER BY sort_order ASC, created_at DESC 
+       LIMIT ?`,
+      [type, parseInt(limit)]
+    );
+
+    // Get images for each product
+    const productsWithImages = await Promise.all(
+      products.map(async (product) => {
+        const [images] = await db.query(
+          'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
+          [product.id]
+        );
+
+        const parsedProduct = parseProductFields(product);
+        
+        parsedProduct.images = images.map(img => ({
+          id: img.id,
+          url: img.image_url,
+          isMain: img.is_main === 1,
+          sortOrder: img.sort_order
+        }));
+
+        const mainImage = images.find(img => img.is_main === 1);
+        parsedProduct.mainImage = mainImage ? mainImage.image_url : 
+          (images.length > 0 ? images[0].image_url : product.image_url);
+        
+        parsedProduct.image_url = parsedProduct.mainImage;
+
+        return parsedProduct;
+      })
+    );
+
+    console.log(`✅ Found ${productsWithImages.length} products for type: ${type}`);
+
+    res.json({
+      success: true,
+      products: productsWithImages,
+      count: productsWithImages.length
+    });
+  } catch (error) {
+    console.error('Get products by type error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error fetching products'
@@ -413,7 +720,6 @@ app.get('/api/products/:id', async (req, res) => {
 
     const product = products[0];
 
-    // Get all images for this product
     const [images] = await db.query(
       'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
       [id]
@@ -428,7 +734,6 @@ app.get('/api/products/:id', async (req, res) => {
       sortOrder: img.sort_order
     }));
 
-    // Set main image
     const mainImage = images.find(img => img.is_main === 1);
     parsedProduct.mainImage = mainImage ? mainImage.image_url : 
       (images.length > 0 ? images[0].image_url : product.image_url);
@@ -463,7 +768,6 @@ app.post('/api/products', upload.array('images', 10), handleUploadErrors, async 
     console.log('📥 Received product data:', { name, category, type, price });
 
     if (!name || !category || !type) {
-      // Clean up uploaded files if validation fails
       if (req.files) {
         req.files.forEach(file => {
           const filePath = path.join(__dirname, 'uploads/products', file.filename);
@@ -507,15 +811,22 @@ app.post('/api/products', upload.array('images', 10), handleUploadErrors, async 
       }
     }
 
-    // Insert product
+    // Get next sort_order for this type
+    const [maxSortResult] = await db.query(
+      'SELECT MAX(sort_order) as max_sort FROM products WHERE type = ?',
+      [type]
+    );
+    const nextSortOrder = (maxSortResult[0].max_sort || 0) + 1;
+
+    // Insert product with sort_order
     const [result] = await db.query(
       `INSERT INTO products (
         name, description, short_description, category, subcategory, type,
         price, compare_price, cost_price, stock_quantity, sku,
         dimensions, tolerance, flaws, weight, standards,
         materials, specifications, features,
-        meta_title, meta_description, meta_keywords, is_featured
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        meta_title, meta_description, meta_keywords, is_featured, sort_order
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         name, 
         description || '', 
@@ -539,12 +850,13 @@ app.post('/api/products', upload.array('images', 10), handleUploadErrors, async 
         meta_title || null, 
         meta_description || null, 
         meta_keywords || null,
-        is_featured === 'true' || is_featured === true || false
+        is_featured === 'true' || is_featured === true || false,
+        nextSortOrder
       ]
     );
 
     const productId = result.insertId;
-    console.log('✅ Product inserted with ID:', productId);
+    console.log('✅ Product inserted with ID:', productId, 'sort_order:', nextSortOrder);
 
     // Handle images
     let mainImageUrl = null;
@@ -567,13 +879,12 @@ app.post('/api/products', upload.array('images', 10), handleUploadErrors, async 
         );
       }
 
-      // If main image was set, update product
       if (mainImageUrl) {
         await db.query('UPDATE products SET image_url = ? WHERE id = ?', [mainImageUrl, productId]);
       }
     }
 
-    // Fetch the created product with images
+    // Fetch the created product
     const [productRows] = await db.query('SELECT * FROM products WHERE id = ?', [productId]);
     const [imageRows] = await db.query(
       'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
@@ -588,7 +899,6 @@ app.post('/api/products', upload.array('images', 10), handleUploadErrors, async 
       sortOrder: img.sort_order
     }));
 
-    // Set main image
     const mainImage = imageRows.find(img => img.is_main === 1);
     product.mainImage = mainImage ? mainImage.image_url : 
       (imageRows.length > 0 ? imageRows[0].image_url : product.image_url);
@@ -605,7 +915,6 @@ app.post('/api/products', upload.array('images', 10), handleUploadErrors, async 
   } catch (error) {
     console.error('❌ Create product error:', error);
     
-    // Clean up uploaded files on error
     if (req.files) {
       req.files.forEach(file => {
         const filePath = path.join(__dirname, 'uploads/products', file.filename);
@@ -632,12 +941,11 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
       dimensions, tolerance, flaws, weight, standards,
       materials, specifications, features,
       meta_title, meta_description, meta_keywords,
-      is_featured, mainImageIndex, mainImageId, deleteImages
+      is_featured, mainImageIndex, mainImageId, deleteImages, sort_order
     } = req.body;
 
     console.log('📝 Updating product ID:', id);
 
-    // Check if product exists
     const [existing] = await db.query('SELECT * FROM products WHERE id = ?', [id]);
     if (existing.length === 0) {
       return res.status(404).json({
@@ -676,20 +984,19 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
 
     // Add new images
     if (req.files && req.files.length > 0) {
-      // Get current max sort order
       const [maxOrder] = await db.query(
         'SELECT MAX(sort_order) as max_order FROM product_images WHERE product_id = ?',
         [id]
       );
-      let sortOrder = (maxOrder[0].max_order || -1) + 1;
+      let sortOrderImg = (maxOrder[0].max_order || -1) + 1;
 
-      console.log('📸 Adding', req.files.length, 'new images starting at sort order:', sortOrder);
+      console.log('📸 Adding', req.files.length, 'new images');
 
       for (let i = 0; i < req.files.length; i++) {
         const file = req.files[i];
         await db.query(
           'INSERT INTO product_images (product_id, image_url, is_main, sort_order) VALUES (?, ?, ?, ?)',
-          [id, `/uploads/products/${file.filename}`, 0, sortOrder + i]
+          [id, `/uploads/products/${file.filename}`, 0, sortOrderImg + i]
         );
       }
     }
@@ -698,11 +1005,9 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
     if (mainImageId !== undefined && mainImageId !== null) {
       console.log('⭐ Setting main image by ID:', mainImageId);
       
-      // Set specified existing image as main
       await db.query('UPDATE product_images SET is_main = 0 WHERE product_id = ?', [id]);
       await db.query('UPDATE product_images SET is_main = 1 WHERE id = ? AND product_id = ?', [mainImageId, id]);
       
-      // Get image URL and update product
       const [mainImageRow] = await db.query(
         'SELECT image_url FROM product_images WHERE id = ?',
         [mainImageId]
@@ -713,7 +1018,6 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
     } else if (mainImageIndex !== undefined && mainImageIndex !== null) {
       console.log('⭐ Setting main image by index:', mainImageIndex);
       
-      // Set image at index as main (for new images)
       const [allImages] = await db.query(
         'SELECT id, image_url FROM product_images WHERE product_id = ? ORDER BY sort_order ASC',
         [id]
@@ -727,7 +1031,7 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
       }
     }
 
-    // Parse JSON fields for update
+    // Parse JSON fields
     let materialsArray = [];
     if (materials !== undefined) {
       try {
@@ -763,7 +1067,7 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
       name, description, short_description, category, subcategory, type,
       price, compare_price, cost_price, stock_quantity, sku,
       dimensions, tolerance, flaws, weight, standards,
-      meta_title, meta_description, meta_keywords, is_featured
+      meta_title, meta_description, meta_keywords, is_featured, sort_order
     };
 
     Object.entries(fields).forEach(([key, value]) => {
@@ -771,7 +1075,7 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
         if (key === 'price' || key === 'compare_price' || key === 'cost_price') {
           updates.push(`${key} = ?`);
           params.push(value !== '' ? parseFloat(value) : null);
-        } else if (key === 'stock_quantity') {
+        } else if (key === 'stock_quantity' || key === 'sort_order') {
           updates.push(`${key} = ?`);
           params.push(value !== '' ? parseInt(value) : 0);
         } else if (key === 'is_featured') {
@@ -808,7 +1112,7 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
       );
     }
 
-    // Fetch updated product with images
+    // Fetch updated product
     const [productRows] = await db.query('SELECT * FROM products WHERE id = ?', [id]);
     const [imageRows] = await db.query(
       'SELECT * FROM product_images WHERE product_id = ? ORDER BY is_main DESC, sort_order ASC',
@@ -823,7 +1127,6 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
       sortOrder: img.sort_order
     }));
 
-    // Set main image
     const mainImage = imageRows.find(img => img.is_main === 1);
     product.mainImage = mainImage ? mainImage.image_url : 
       (imageRows.length > 0 ? imageRows[0].image_url : product.image_url);
@@ -840,7 +1143,6 @@ app.put('/api/products/:id', upload.array('images', 10), handleUploadErrors, asy
   } catch (error) {
     console.error('❌ Update product error:', error);
     
-    // Clean up uploaded files on error
     if (req.files && req.files.length > 0) {
       req.files.forEach(file => {
         const filePath = path.join(__dirname, 'uploads/products', file.filename);
@@ -864,13 +1166,11 @@ app.delete('/api/products/:id', async (req, res) => {
 
     console.log('🗑️ Deleting product ID:', id);
 
-    // Get all images for this product
     const [images] = await db.query(
       'SELECT image_url FROM product_images WHERE product_id = ?',
       [id]
     );
 
-    // Delete all image files
     for (const img of images) {
       const imagePath = path.join(__dirname, img.image_url);
       if (fs.existsSync(imagePath)) {
@@ -879,7 +1179,6 @@ app.delete('/api/products/:id', async (req, res) => {
       }
     }
 
-    // Delete from database (product_images will be deleted by CASCADE)
     await db.query('DELETE FROM products WHERE id = ?', [id]);
 
     console.log('✅ Product deleted successfully:', id);
@@ -911,15 +1210,12 @@ app.delete('/api/products/bulk', async (req, res) => {
 
     console.log('🗑️ Bulk deleting products:', ids);
 
-    // Delete each product
     for (const id of ids) {
-      // Get all images for this product
       const [images] = await db.query(
         'SELECT image_url FROM product_images WHERE product_id = ?',
         [id]
       );
 
-      // Delete all image files
       for (const img of images) {
         const imagePath = path.join(__dirname, img.image_url);
         if (fs.existsSync(imagePath)) {
@@ -927,7 +1223,6 @@ app.delete('/api/products/bulk', async (req, res) => {
         }
       }
 
-      // Delete from database
       await db.query('DELETE FROM products WHERE id = ?', [id]);
     }
 
@@ -982,11 +1277,10 @@ app.get('/api/products/search/:keyword', async (req, res) => {
       `SELECT * FROM products 
        WHERE is_active = TRUE 
        AND (name LIKE ? OR description LIKE ? OR category LIKE ? OR sku LIKE ?)
-       ORDER BY name ASC`,
+       ORDER BY sort_order ASC, name ASC`,
       [searchTerm, searchTerm, searchTerm, searchTerm]
     );
 
-    // Get images for each product
     const productsWithImages = await Promise.all(
       products.map(async (product) => {
         const [images] = await db.query(
@@ -1003,7 +1297,6 @@ app.get('/api/products/search/:keyword', async (req, res) => {
           sortOrder: img.sort_order
         }));
 
-        // Set main image
         const mainImage = images.find(img => img.is_main === 1);
         parsedProduct.mainImage = mainImage ? mainImage.image_url : 
           (images.length > 0 ? images[0].image_url : product.image_url);
@@ -1027,6 +1320,10 @@ app.get('/api/products/search/:keyword', async (req, res) => {
     });
   }
 });
+
+/* =========================
+   UTILITY ENDPOINTS
+========================= */
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -1055,7 +1352,7 @@ app.get('/api/test-db', async (req, res) => {
   }
 });
 
-// List all uploads (for debugging)
+// List all uploads
 app.get('/api/uploads/list', (req, res) => {
   const uploadPath = path.join(__dirname, 'uploads/products');
   
@@ -1075,7 +1372,7 @@ app.get('/api/uploads/list', (req, res) => {
   });
 });
 
-// Clear all uploads (for debugging - use with caution!)
+// Clear all uploads
 app.delete('/api/uploads/clear', (req, res) => {
   const uploadPath = path.join(__dirname, 'uploads/products');
   
@@ -1101,7 +1398,11 @@ app.delete('/api/uploads/clear', (req, res) => {
   });
 });
 
-// Error handling
+/* =========================
+   ERROR HANDLING
+========================= */
+
+// Error handling middleware
 app.use((err, req, res, next) => {
   console.error('❌ Server Error:', err);
   res.status(500).json({
@@ -1120,7 +1421,9 @@ app.use((req, res) => {
   });
 });
 
-// Start server
+/* =========================
+   START SERVER
+========================= */
 const PORT = process.env.PORT || 5001;
 
 app.listen(PORT, async () => {
