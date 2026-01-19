@@ -17,6 +17,19 @@ const galleryRoutes = require('./routes/galleryRoutes');
 const app = express();
 
 /* =========================
+   ROOT ROUTE
+========================= */
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: '🚀 NDT Products API is running',
+    health: '/api/health',
+    docs: 'Not available',
+    version: '1.0.0'
+  });
+});
+
+/* =========================
    Middleware
 ========================= */
 app.use(cors({ origin: '*', credentials: true }));
@@ -1327,7 +1340,7 @@ app.get('/api/products/search/:keyword', async (req, res) => {
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ 
+    res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
     service: 'NDT Products API',
@@ -1421,10 +1434,12 @@ app.use((req, res) => {
   });
 });
 
+
 /* =========================
    START SERVER
 ========================= */
 const PORT = process.env.PORT || 5001;
+
 
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
@@ -1444,3 +1459,5 @@ app.listen(PORT, async () => {
     console.error('❌ Database connection failed:', error.message);
   }
 });
+
+

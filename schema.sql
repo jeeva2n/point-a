@@ -1,8 +1,8 @@
 -- ==============================
 -- CREATE DATABASE
 -- ==============================
-CREATE DATABASE IF NOT EXISTS daks_ndt;
-USE daks_ndt;
+CREATE DATABASE IF NOT EXISTS dakstool_website;
+USE dakstool_website;
 
 -- ==============================
 -- 1. ADMINS TABLE

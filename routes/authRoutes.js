@@ -3,6 +3,8 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const db = require('../config/database');
+const bcrypt = require('bcryptjs'); // Add at top of file
+
 
 const JWT_SECRET = process.env.JWT_SECRET || 'daks-ndt-super-secret-jwt-key-2024';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
@@ -77,14 +79,21 @@ router.post('/verify-otp', async (req, res) => {
 
     await db.query('UPDATE otp_codes SET is_used = TRUE WHERE id = ?', [otpRecords[0].id]);
 
-    let [users] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
-    let user;
+   let [users] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
+let user;
     
-    if (users.length === 0) {
-      const [result] = await db.query('INSERT INTO users (email, is_verified) VALUES (?, ?)', [email, true]);
-      [users] = await db.query('SELECT * FROM users WHERE id = ?', [result.insertId]);
-    }
-    user = users[0];
+if (users.length === 0) {
+  // User doesn't exist, create with empty password
+  const [result] = await db.query(
+    'INSERT INTO users (email, password, is_verified) VALUES (?, ?, ?)', 
+    [email, '', true]
+  );
+  [users] = await db.query('SELECT * FROM users WHERE id = ?', [result.insertId]);
+} else {
+  // User exists, update is_verified if needed
+  await db.query('UPDATE users SET is_verified = ? WHERE email = ?', [true, email]);
+}
+user = users[0];
 
     // Update Cart/Quote ownership if needed
     if (cartId) await db.query('UPDATE carts SET user_id = ? WHERE id = ?', [user.id, cartId]);
