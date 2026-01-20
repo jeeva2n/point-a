@@ -59,15 +59,16 @@ app.use('/api/gallery', galleryRoutes);
 const mysql = require('mysql2');
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'daks_user',
-  password: process.env.DB_PASSWORD || 'Daks@2026.',
-  database: process.env.DB_NAME || 'daks_ndt',
+  user: process.env.DB_USER || 'dakstool_dakstool',
+  password: process.env.DB_PASSWORD || '040995aBI@',
+  database: process.env.DB_NAME || 'dakstool_daks_ndt',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0
 });
 
 const db = pool.promise();
+
 
 /* =========================
    Helper: Get Connection (for transactions)
@@ -1438,7 +1439,7 @@ app.use((req, res) => {
 /* =========================
    START SERVER
 ========================= */
-const PORT = process.env.PORT || 5003;
+const PORT = process.env.PORT || 5001;
 
 
 app.listen(PORT, async () => {
